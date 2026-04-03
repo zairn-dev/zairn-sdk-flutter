@@ -317,6 +317,504 @@ class ZairnSdk {
   }
 
   // =====================
+  // Share Rules
+  // =====================
+
+  /// Allow a user to see your location.
+  Future<void> allow(String viewerId, {ShareLevel level = ShareLevel.current}) async {
+    final userId = await _getUserId();
+    await _supabase.from('share_rules').upsert({
+      'owner_id': userId,
+      'viewer_id': viewerId,
+      'level': level.name,
+    });
+  }
+
+  /// Revoke location sharing with a user.
+  Future<void> revoke(String viewerId) async {
+    final userId = await _getUserId();
+    await _supabase.from('share_rules')
+        .delete()
+        .eq('owner_id', userId)
+        .eq('viewer_id', viewerId);
+  }
+
+  /// Set share expiry for a viewer.
+  Future<void> setShareExpiry(String viewerId, DateTime expiresAt) async {
+    final userId = await _getUserId();
+    await _supabase.from('share_rules')
+        .update({'expires_at': expiresAt.toIso8601String()})
+        .eq('owner_id', userId)
+        .eq('viewer_id', viewerId);
+  }
+
+  // =====================
+  // Groups
+  // =====================
+
+  /// Create a group.
+  Future<Map<String, dynamic>> createGroup(String name, {String? description}) async {
+    final userId = await _getUserId();
+    final inviteCode = DateTime.now().millisecondsSinceEpoch.toRadixString(36);
+    final response = await _supabase.from('groups').insert({
+      'name': name,
+      'description': description,
+      'created_by': userId,
+      'invite_code': inviteCode,
+    }).select().single();
+    // Auto-join as owner
+    await _supabase.from('group_members').insert({
+      'group_id': response['id'],
+      'user_id': userId,
+      'role': 'owner',
+    });
+    return response;
+  }
+
+  /// Get groups the current user belongs to.
+  Future<List<Map<String, dynamic>>> getGroups() async {
+    final userId = await _getUserId();
+    final memberships = await _supabase
+        .from('group_members')
+        .select('group_id')
+        .eq('user_id', userId);
+    if ((memberships as List).isEmpty) return [];
+    final groupIds = memberships.map((m) => m['group_id']).toList();
+    final response = await _supabase
+        .from('groups')
+        .select()
+        .inFilter('id', groupIds);
+    return List<Map<String, dynamic>>.from(response);
+  }
+
+  /// Join a group by invite code.
+  Future<Map<String, dynamic>> joinGroup(String inviteCode) async {
+    final userId = await _getUserId();
+    final group = await _supabase
+        .from('groups')
+        .select()
+        .eq('invite_code', inviteCode)
+        .single();
+    await _supabase.from('group_members').insert({
+      'group_id': group['id'],
+      'user_id': userId,
+      'role': 'member',
+    });
+    return group;
+  }
+
+  /// Leave a group.
+  Future<void> leaveGroup(String groupId) async {
+    final userId = await _getUserId();
+    await _supabase.from('group_members')
+        .delete()
+        .eq('group_id', groupId)
+        .eq('user_id', userId);
+  }
+
+  // =====================
+  // Chat
+  // =====================
+
+  /// Get or create a direct chat room with another user.
+  Future<Map<String, dynamic>> getOrCreateDirectChat(String otherUserId) async {
+    final userId = await _getUserId();
+    // Check existing
+    final existing = await _supabase
+        .from('chat_rooms')
+        .select('*, chat_room_members!inner(*)')
+        .eq('type', 'direct')
+        .eq('chat_room_members.user_id', userId);
+
+    for (final room in existing as List) {
+      final members = await _supabase
+          .from('chat_room_members')
+          .select('user_id')
+          .eq('room_id', room['id']);
+      final memberIds = (members as List).map((m) => m['user_id']).toSet();
+      if (memberIds.contains(otherUserId) && memberIds.length == 2) {
+        return room;
+      }
+    }
+
+    // Create new
+    final room = await _supabase.from('chat_rooms')
+        .insert({'type': 'direct', 'created_by': userId})
+        .select().single();
+    await _supabase.from('chat_room_members').insert([
+      {'room_id': room['id'], 'user_id': userId},
+      {'room_id': room['id'], 'user_id': otherUserId},
+    ]);
+    return room;
+  }
+
+  /// Send a message to a chat room.
+  Future<Map<String, dynamic>> sendMessage(String roomId, String content, {String type = 'text'}) async {
+    final userId = await _getUserId();
+    return await _supabase.from('messages').insert({
+      'room_id': roomId,
+      'sender_id': userId,
+      'content': content,
+      'type': type,
+    }).select().single();
+  }
+
+  /// Get messages in a chat room.
+  Future<List<Map<String, dynamic>>> getMessages(String roomId, {int limit = 50, int offset = 0}) async {
+    final response = await _supabase
+        .from('messages')
+        .select()
+        .eq('room_id', roomId)
+        .order('created_at', ascending: false)
+        .range(offset, offset + limit - 1);
+    return List<Map<String, dynamic>>.from(response);
+  }
+
+  /// Subscribe to new messages in a room.
+  RealtimeChannel subscribeMessages(
+    String roomId,
+    void Function(Map<String, dynamic>) onMessage, {
+    void Function(String, Object?)? onError,
+  }) {
+    return _supabase
+        .channel('messages:$roomId')
+        .onPostgresChanges(
+          event: PostgresChangeEvent.insert,
+          schema: 'public',
+          table: 'messages',
+          filter: PostgresChangeFilter(
+            type: PostgresChangeFilterType.eq,
+            column: 'room_id',
+            value: roomId,
+          ),
+          callback: (payload) {
+            if (payload.newRecord.isNotEmpty) {
+              onMessage(payload.newRecord);
+            }
+          },
+        )
+        .subscribe((status, [error]) {
+      if (status == RealtimeSubscribeStatus.channelError ||
+          status == RealtimeSubscribeStatus.timedOut) {
+        onError?.call(status.name, error);
+      }
+    });
+  }
+
+  // =====================
+  // Reactions
+  // =====================
+
+  /// Send an emoji reaction to a friend.
+  Future<Map<String, dynamic>> sendReaction(String toUserId, String emoji, {String? message}) async {
+    final userId = await _getUserId();
+    return await _supabase.from('location_reactions').insert({
+      'from_user_id': userId,
+      'to_user_id': toUserId,
+      'emoji': emoji,
+      if (message != null) 'message': message,
+    }).select().single();
+  }
+
+  /// Get received reactions.
+  Future<List<Map<String, dynamic>>> getReceivedReactions({int limit = 20, DateTime? since}) async {
+    final userId = await _getUserId();
+    var query = _supabase
+        .from('location_reactions')
+        .select()
+        .eq('to_user_id', userId);
+    if (since != null) {
+      query = query.gte('created_at', since.toIso8601String());
+    }
+    final response = await query.order('created_at', ascending: false).limit(limit);
+    return List<Map<String, dynamic>>.from(response);
+  }
+
+  // =====================
+  // Bump Detection
+  // =====================
+
+  /// Find nearby friends within radius.
+  Future<List<Map<String, dynamic>>> findNearbyFriends(double lat, double lon, {double radiusM = 500}) async {
+    final friends = await getFriendsLocations();
+    return friends
+        .where((f) => haversine(lat, lon, f.lat, f.lon) <= radiusM)
+        .map((f) => {
+              'user_id': f.userId,
+              'lat': f.lat,
+              'lon': f.lon,
+              'distance_meters': haversine(lat, lon, f.lat, f.lon).round(),
+            })
+        .toList()
+      ..sort((a, b) => (a['distance_meters'] as int).compareTo(b['distance_meters'] as int));
+  }
+
+  /// Record a bump event with a nearby user.
+  Future<Map<String, dynamic>> recordBump(String nearbyUserId, double distance, double lat, double lon) async {
+    final userId = await _getUserId();
+    return await _supabase.from('bump_events').insert({
+      'user_id': userId,
+      'bumped_user_id': nearbyUserId,
+      'distance_meters': distance.round(),
+      'lat': lat,
+      'lon': lon,
+    }).select().single();
+  }
+
+  /// Get bump history.
+  Future<List<Map<String, dynamic>>> getBumpHistory({int limit = 20}) async {
+    final userId = await _getUserId();
+    final response = await _supabase
+        .from('bump_events')
+        .select()
+        .or('user_id.eq.$userId,bumped_user_id.eq.$userId')
+        .order('created_at', ascending: false)
+        .limit(limit);
+    return List<Map<String, dynamic>>.from(response);
+  }
+
+  // =====================
+  // Favorite Places
+  // =====================
+
+  /// Add a favorite place.
+  Future<Map<String, dynamic>> addFavoritePlace({
+    required String label,
+    required double lat,
+    required double lon,
+    double radiusM = 100,
+    String? name,
+  }) async {
+    final userId = await _getUserId();
+    return await _supabase.from('favorite_places').insert({
+      'user_id': userId,
+      'label': label,
+      'lat': lat,
+      'lon': lon,
+      'radius_meters': radiusM,
+      if (name != null) 'name': name,
+    }).select().single();
+  }
+
+  /// Get favorite places.
+  Future<List<Map<String, dynamic>>> getFavoritePlaces({String? userId}) async {
+    final uid = userId ?? await _getUserId();
+    final response = await _supabase
+        .from('favorite_places')
+        .select()
+        .eq('user_id', uid);
+    return List<Map<String, dynamic>>.from(response);
+  }
+
+  /// Delete a favorite place.
+  Future<void> deleteFavoritePlace(String placeId) async {
+    await _supabase.from('favorite_places').delete().eq('id', placeId);
+  }
+
+  // =====================
+  // Block / Unblock
+  // =====================
+
+  /// Block a user.
+  Future<void> blockUser(String targetUserId) async {
+    final userId = await _getUserId();
+    await _supabase.from('blocked_users').upsert({
+      'user_id': userId,
+      'blocked_user_id': targetUserId,
+    });
+  }
+
+  /// Unblock a user.
+  Future<void> unblockUser(String targetUserId) async {
+    final userId = await _getUserId();
+    await _supabase.from('blocked_users')
+        .delete()
+        .eq('user_id', userId)
+        .eq('blocked_user_id', targetUserId);
+  }
+
+  /// Get list of blocked user IDs.
+  Future<List<String>> getBlockedUsers() async {
+    final userId = await _getUserId();
+    final response = await _supabase
+        .from('blocked_users')
+        .select('blocked_user_id')
+        .eq('user_id', userId);
+    return (response as List).map((r) => r['blocked_user_id'] as String).toList();
+  }
+
+  // =====================
+  // Status
+  // =====================
+
+  /// Set status emoji and text.
+  Future<void> setStatus(String emoji, {String? text, int? durationMinutes}) async {
+    final userId = await _getUserId();
+    await _supabase.from('profiles').upsert({
+      'user_id': userId,
+      'status_emoji': emoji,
+      if (text != null) 'status_text': text,
+      if (durationMinutes != null)
+        'status_expires_at': DateTime.now().add(Duration(minutes: durationMinutes)).toIso8601String(),
+      'updated_at': DateTime.now().toIso8601String(),
+    });
+  }
+
+  /// Clear status.
+  Future<void> clearStatus() async {
+    final userId = await _getUserId();
+    await _supabase.from('profiles').update({
+      'status_emoji': null,
+      'status_text': null,
+      'status_expires_at': null,
+      'updated_at': DateTime.now().toIso8601String(),
+    }).eq('user_id', userId);
+  }
+
+  // =====================
+  // Search
+  // =====================
+
+  /// Search user profiles by username or display name.
+  Future<List<Profile>> searchProfiles(String query) async {
+    final response = await _supabase
+        .from('profiles')
+        .select()
+        .or('username.ilike.%$query%,display_name.ilike.%$query%')
+        .limit(20);
+    return (response as List)
+        .map((e) => Profile.fromJson(e as Map<String, dynamic>))
+        .toList();
+  }
+
+  // =====================
+  // Friend Requests (extended)
+  // =====================
+
+  /// Get pending friend requests received.
+  Future<List<FriendRequest>> getPendingRequests() async {
+    final userId = await _getUserId();
+    final response = await _supabase
+        .from('friend_requests')
+        .select()
+        .eq('to_user_id', userId)
+        .eq('status', 'pending');
+    return (response as List)
+        .map((e) => FriendRequest.fromJson(e as Map<String, dynamic>))
+        .toList();
+  }
+
+  /// Get sent friend requests.
+  Future<List<FriendRequest>> getSentRequests() async {
+    final userId = await _getUserId();
+    final response = await _supabase
+        .from('friend_requests')
+        .select()
+        .eq('from_user_id', userId)
+        .eq('status', 'pending');
+    return (response as List)
+        .map((e) => FriendRequest.fromJson(e as Map<String, dynamic>))
+        .toList();
+  }
+
+  /// Reject a friend request.
+  Future<void> rejectFriendRequest(int requestId) async {
+    await _supabase.from('friend_requests')
+        .update({'status': 'rejected', 'updated_at': DateTime.now().toIso8601String()})
+        .eq('id', requestId);
+  }
+
+  /// Cancel a sent friend request.
+  Future<void> cancelFriendRequest(int requestId) async {
+    await _supabase.from('friend_requests')
+        .delete()
+        .eq('id', requestId)
+        .eq('status', 'pending');
+  }
+
+  // =====================
+  // Streaks
+  // =====================
+
+  /// Record an interaction with a friend (for streak tracking).
+  Future<void> recordInteraction(String friendId) async {
+    final userId = await _getUserId();
+    await _supabase.rpc('record_friend_interaction', params: {
+      'p_user_id': userId,
+      'p_friend_id': friendId,
+    });
+  }
+
+  /// Get streak with a specific friend.
+  Future<Map<String, dynamic>?> getStreak(String friendId) async {
+    final userId = await _getUserId();
+    return await _supabase
+        .from('friend_streaks')
+        .select()
+        .or('and(user_id.eq.$userId,friend_id.eq.$friendId),and(user_id.eq.$friendId,friend_id.eq.$userId)')
+        .maybeSingle();
+  }
+
+  /// Get all active streaks.
+  Future<List<Map<String, dynamic>>> getStreaks() async {
+    final userId = await _getUserId();
+    final response = await _supabase
+        .from('friend_streaks')
+        .select()
+        .or('user_id.eq.$userId,friend_id.eq.$userId')
+        .gt('streak_count', 0)
+        .order('streak_count', ascending: false);
+    return List<Map<String, dynamic>>.from(response);
+  }
+
+  // =====================
+  // Exploration (Visited Cells)
+  // =====================
+
+  /// Get visited cells for the current user.
+  Future<List<Map<String, dynamic>>> getMyVisitedCells({int limit = 500, int offset = 0}) async {
+    final userId = await _getUserId();
+    final response = await _supabase
+        .from('visited_cells')
+        .select()
+        .eq('user_id', userId)
+        .order('last_visited_at', ascending: false)
+        .range(offset, offset + limit - 1);
+    return List<Map<String, dynamic>>.from(response);
+  }
+
+  /// Get exploration stats.
+  Future<Map<String, dynamic>?> getMyExplorationStats() async {
+    final userId = await _getUserId();
+    return await _supabase
+        .from('exploration_stats')
+        .select()
+        .eq('user_id', userId)
+        .maybeSingle();
+  }
+
+  // =====================
+  // Trails
+  // =====================
+
+  /// Send location with trail recording.
+  Future<void> sendLocationWithTrail(LocationUpdate update) async {
+    await sendLocation(update);
+    await saveLocationHistory(update.lat, update.lon, accuracy: update.accuracy);
+  }
+
+  /// Save a location history point.
+  Future<void> saveLocationHistory(double lat, double lon, {double? accuracy}) async {
+    final userId = await _getUserId();
+    await _supabase.from('locations_history').insert({
+      'user_id': userId,
+      'lat': lat,
+      'lon': lon,
+      if (accuracy != null) 'accuracy': accuracy,
+    });
+  }
+
+  // =====================
   // Utilities
   // =====================
 
