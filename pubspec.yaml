@@ -1,8 +1,9 @@
 name: zairn_sdk
 description: "Privacy-first location sharing SDK for Flutter. Real-time sharing, encrypted geo-drops, zero-knowledge proofs."
 version: 0.1.0
-homepage: https://github.com/zairn-dev/zairn-flutter
-repository: https://github.com/zairn-dev/zairn-flutter
+homepage: https://github.com/zairn-dev/Zairn
+repository: https://github.com/zairn-dev/zairn-sdk-flutter
+issue_tracker: https://github.com/zairn-dev/zairn-sdk-flutter/issues
 
 environment:
   sdk: ^3.8.1
