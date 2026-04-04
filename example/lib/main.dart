@@ -91,7 +91,7 @@ class _TraceCollectorPageState extends State<TraceCollectorPage> {
     // Check permissions
     bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
     if (!serviceEnabled) {
-      _showSnackBar('Location services are disabled');
+      _showSnackBar('Location services are disabled. Please enable GPS.');
       return;
     }
 
@@ -103,6 +103,25 @@ class _TraceCollectorPageState extends State<TraceCollectorPage> {
         return;
       }
     }
+    if (permission == LocationPermission.deniedForever) {
+      _showSnackBar('Location permission permanently denied.');
+      await Geolocator.openAppSettings();
+      return;
+    }
+
+    // Request "Always" permission for background collection
+    if (permission == LocationPermission.whileInUse) {
+      _showSnackBar('Background location needed. Please select "Allow all the time" in the next dialog.');
+      // On Android, this opens the app settings where user can change to "Always"
+      permission = await Geolocator.requestPermission();
+      if (permission == LocationPermission.whileInUse) {
+        // Still only "while in use" — open settings manually
+        await Geolocator.openAppSettings();
+        _showSnackBar('Please select "Allow all the time" in app settings, then tap Start again.');
+        return;
+      }
+    }
+
     if (permission == LocationPermission.deniedForever) {
       _showSnackBar('Location permission permanently denied. Enable in settings.');
       return;
