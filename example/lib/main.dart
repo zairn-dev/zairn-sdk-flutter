@@ -62,8 +62,12 @@ class _TraceCollectorPageState extends State<TraceCollectorPage> with WidgetsBin
   int _intervalSeconds = 60;
   Map<String, dynamic>? _lastPoint;
 
+  // Android: GPS stream (protected by foreground service)
   StreamSubscription<Position>? _posStream;
   int _lastRecordedTs = 0;
+
+  // iOS: periodic getCurrentPosition (no long-lived stream)
+  Timer? _iosTimer;
 
   PrivacyProcessor? _privacyProcessor;
   LocationState? _lastPrivacyState;
@@ -81,7 +85,8 @@ class _TraceCollectorPageState extends State<TraceCollectorPage> with WidgetsBin
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
-    _stop();
+    _posStream?.cancel();
+    _iosTimer?.cancel();
     super.dispose();
   }
 
@@ -140,26 +145,24 @@ class _TraceCollectorPageState extends State<TraceCollectorPage> with WidgetsBin
         await _startAndroidService();
       }
 
-      // Both platforms: GPS stream + timer in main isolate
-      final locationSettings = Platform.isIOS
-          ? AppleSettings(
-              accuracy: LocationAccuracy.high,
-              distanceFilter: 0,
-              activityType: ActivityType.other,
-              pauseLocationUpdatesAutomatically: false,
-              showBackgroundLocationIndicator: true,
-              allowBackgroundLocationUpdates: true,
-            )
-          : const LocationSettings(accuracy: LocationAccuracy.high, distanceFilter: 0);
-
-      _posStream = Geolocator.getPositionStream(locationSettings: locationSettings)
-          .listen((pos) {
-        // Throttle: only record if enough time has passed
-        final now = DateTime.now().millisecondsSinceEpoch;
-        if (now - _lastRecordedTs >= _intervalSeconds * 1000) {
-          _recordPoint(pos);
-        }
-      });
+      if (Platform.isAndroid) {
+        // Android: GPS stream protected by foreground service
+        _posStream = Geolocator.getPositionStream(
+          locationSettings: const LocationSettings(accuracy: LocationAccuracy.high, distanceFilter: 0),
+        ).listen((pos) {
+          final now = DateTime.now().millisecondsSinceEpoch;
+          if (now - _lastRecordedTs >= _intervalSeconds * 1000) {
+            _recordPoint(pos);
+          }
+        });
+      } else {
+        // iOS: periodic getCurrentPosition (no long-lived stream = no memory leak)
+        // First point immediately
+        _fetchAndRecordIos();
+        _iosTimer = Timer.periodic(Duration(seconds: _intervalSeconds), (_) {
+          _fetchAndRecordIos();
+        });
+      }
 
       setState(() => _isCollecting = true);
       _showSnackBar('Recording every ${_intervalSeconds}s');
@@ -196,6 +199,23 @@ class _TraceCollectorPageState extends State<TraceCollectorPage> with WidgetsBin
       notificationText: 'Recording...',
       callback: startCallback,
     );
+  }
+
+  Future<void> _fetchAndRecordIos() async {
+    try {
+      final pos = await Geolocator.getCurrentPosition(
+        locationSettings: AppleSettings(
+          accuracy: LocationAccuracy.high,
+          allowBackgroundLocationUpdates: true,
+          showBackgroundLocationIndicator: true,
+          pauseLocationUpdatesAutomatically: false,
+          activityType: ActivityType.other,
+        ),
+      );
+      _recordPoint(pos);
+    } catch (e) {
+      debugPrint('iOS GPS error: $e');
+    }
   }
 
   void _recordPoint(Position pos) {
@@ -236,6 +256,8 @@ class _TraceCollectorPageState extends State<TraceCollectorPage> with WidgetsBin
   Future<void> _stop() async {
     _posStream?.cancel();
     _posStream = null;
+    _iosTimer?.cancel();
+    _iosTimer = null;
     if (Platform.isAndroid) {
       await FlutterForegroundTask.stopService();
     }
