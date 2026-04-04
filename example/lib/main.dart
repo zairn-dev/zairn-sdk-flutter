@@ -164,6 +164,8 @@ class _TraceCollectorPageState extends State<TraceCollectorPage> with WidgetsBin
   // Data handling
   // =====================
 
+  int _saveCounter = 0;
+
   void _addPoint(Map<String, dynamic> point) {
     try {
       _privacyProcessor ??= createPrivacyProcessor(
@@ -173,7 +175,12 @@ class _TraceCollectorPageState extends State<TraceCollectorPage> with WidgetsBin
       final lon = (point['lon'] as num).toDouble();
       _lastPrivacyState = _privacyProcessor!.process(lat, lon);
       _trace.add(point);
-      _saveTrace();
+      // Save every 5 points to reduce IO load
+      _saveCounter++;
+      if (_saveCounter >= 5) {
+        _saveCounter = 0;
+        _saveTrace();
+      }
       if (mounted) setState(() {});
     } catch (_) {
       // Silently ignore errors during background/foreground transitions
@@ -296,6 +303,7 @@ class _TraceCollectorPageState extends State<TraceCollectorPage> with WidgetsBin
     } else {
       _stopIos();
     }
+    await _saveTrace(); // Ensure all points are saved
     setState(() => _isCollecting = false);
   }
 
