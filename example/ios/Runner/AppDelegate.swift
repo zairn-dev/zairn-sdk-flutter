@@ -106,7 +106,7 @@ import CoreLocation
       "timestamp": now.timeIntervalSince1970 * 1000,
     ]
 
-    // Write directly to file (survives Flutter engine death)
+    // Write directly to file ONLY — never touch Flutter in background
     if let jsonData = try? JSONSerialization.data(withJSONObject: data),
        let jsonString = String(data: jsonData, encoding: .utf8) {
       traceFileHandle?.write((jsonString + "\n").data(using: .utf8)!)
@@ -114,13 +114,14 @@ import CoreLocation
       pointCount += 1
     }
 
-    // Also send to Dart UI if available (best-effort)
-    DispatchQueue.main.async { [weak self] in
-      guard let sink = self?.eventSink else { return }
-      sink(data)
+    // Only send to Dart when app is in foreground
+    if UIApplication.shared.applicationState == .active {
+      DispatchQueue.main.async { [weak self] in
+        self?.eventSink?(data)
+      }
     }
 
-    NSLog("[ZairnLocation] #%d %.6f, %.6f (±%.0fm)", pointCount, location.coordinate.latitude, location.coordinate.longitude, location.horizontalAccuracy)
+    NSLog("[ZairnLocation] #%d %.6f, %.6f (±%.0fm) bg=%@", pointCount, location.coordinate.latitude, location.coordinate.longitude, location.horizontalAccuracy, UIApplication.shared.applicationState == .active ? "NO" : "YES")
   }
 
   func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
