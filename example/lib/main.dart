@@ -3,10 +3,70 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:intl/intl.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:zairn_sdk/zairn_sdk.dart';
+
+// ============================================================
+// Foreground task handler (runs as Android foreground service)
+// ============================================================
+
+@pragma('vm:entry-point')
+void startCallback() {
+  FlutterForegroundTask.setTaskHandler(LocationTaskHandler());
+}
+
+class LocationTaskHandler extends TaskHandler {
+  StreamSubscription<Position>? _posStream;
+  Position? _lastPos;
+
+  @override
+  Future<void> onStart(DateTime timestamp, TaskStarter starter) async {
+    _posStream = Geolocator.getPositionStream(
+      locationSettings: const LocationSettings(
+        accuracy: LocationAccuracy.high,
+        distanceFilter: 0,
+      ),
+    ).listen((pos) {
+      _lastPos = pos;
+    });
+  }
+
+  @override
+  void onRepeatEvent(DateTime timestamp) {
+    final pos = _lastPos;
+    if (pos == null) return;
+
+    final now = DateTime.now();
+    final point = {
+      'lat': double.parse(pos.latitude.toStringAsFixed(7)),
+      'lon': double.parse(pos.longitude.toStringAsFixed(7)),
+      'accuracy': pos.accuracy.round(),
+      'speed': pos.speed,
+      'altitude': pos.altitude,
+      'timestamp': now.toIso8601String(),
+      'hour': now.hour,
+      'ts': now.millisecondsSinceEpoch,
+    };
+
+    FlutterForegroundTask.sendDataToMain(point);
+    FlutterForegroundTask.updateService(
+      notificationTitle: 'Zairn Trace',
+      notificationText: '${pos.latitude.toStringAsFixed(4)}, ${pos.longitude.toStringAsFixed(4)} | ${DateFormat('HH:mm').format(now)}',
+    );
+  }
+
+  @override
+  Future<void> onDestroy(DateTime timestamp) async {
+    _posStream?.cancel();
+  }
+}
+
+// ============================================================
+// App
+// ============================================================
 
 void main() {
   runApp(const ZairnExampleApp());
@@ -19,24 +79,17 @@ class ZairnExampleApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'Zairn Trace Collector',
-      theme: ThemeData(
-        colorSchemeSeed: const Color(0xFF6442D6),
-        useMaterial3: true,
-      ),
-      darkTheme: ThemeData(
-        colorSchemeSeed: const Color(0xFF6442D6),
-        brightness: Brightness.dark,
-        useMaterial3: true,
-      ),
+      theme: ThemeData(colorSchemeSeed: const Color(0xFF6442D6), useMaterial3: true),
+      darkTheme: ThemeData(colorSchemeSeed: const Color(0xFF6442D6), brightness: Brightness.dark, useMaterial3: true),
       home: const TraceCollectorPage(),
     );
   }
 }
 
-/// Dense location trace collector for IMWUT evaluation.
-///
-/// Records GPS position at regular intervals, stores locally,
-/// and exports as JSON for analysis.
+// ============================================================
+// Main Page
+// ============================================================
+
 class TraceCollectorPage extends StatefulWidget {
   const TraceCollectorPage({super.key});
 
@@ -48,13 +101,9 @@ class _TraceCollectorPageState extends State<TraceCollectorPage> {
   static const _storageKey = 'dense_trace_data';
 
   bool _isCollecting = false;
-  StreamSubscription<Position>? _positionSubscription;
-  Timer? _timer;
-  Position? _lastPosition;
   List<Map<String, dynamic>> _trace = [];
   int _intervalSeconds = 60;
 
-  // Privacy demo
   PrivacyProcessor? _privacyProcessor;
   LocationState? _lastPrivacyState;
 
@@ -62,12 +111,44 @@ class _TraceCollectorPageState extends State<TraceCollectorPage> {
   void initState() {
     super.initState();
     _loadTrace();
+    _initForegroundTask();
+    FlutterForegroundTask.addTaskDataCallback(_onDataFromTask);
   }
 
-  @override
-  void dispose() {
-    _stop();
-    super.dispose();
+  void _initForegroundTask() {
+    FlutterForegroundTask.init(
+      androidNotificationOptions: AndroidNotificationOptions(
+        channelId: 'zairn_trace',
+        channelName: 'Zairn Trace Collector',
+        channelDescription: 'GPS trace collection for research',
+        channelImportance: NotificationChannelImportance.LOW,
+        priority: NotificationPriority.LOW,
+      ),
+      iosNotificationOptions: const IOSNotificationOptions(
+        showNotification: true,
+        playSound: false,
+      ),
+      foregroundTaskOptions: ForegroundTaskOptions(
+        eventAction: ForegroundTaskEventAction.repeat(_intervalSeconds * 1000),
+        autoRunOnBoot: false,
+        allowWakeLock: true,
+        allowWifiLock: false,
+      ),
+    );
+  }
+
+  void _onDataFromTask(Object data) {
+    if (data is Map<String, dynamic>) {
+      _privacyProcessor ??= createPrivacyProcessor(
+        config: PrivacyConfig(gridSeed: 'trace-collector'),
+      );
+      final lat = (data['lat'] as num).toDouble();
+      final lon = (data['lon'] as num).toDouble();
+      _lastPrivacyState = _privacyProcessor!.process(lat, lon);
+
+      setState(() => _trace.add(data));
+      _saveTrace();
+    }
   }
 
   Future<void> _loadTrace() async {
@@ -88,109 +169,58 @@ class _TraceCollectorPageState extends State<TraceCollectorPage> {
   Future<void> _start() async {
     if (_isCollecting) return;
 
-    // Check permissions
-    bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
-    if (!serviceEnabled) {
-      _showSnackBar('Location services are disabled. Please enable GPS.');
+    // Location permission
+    if (!await Geolocator.isLocationServiceEnabled()) {
+      _showSnackBar('Location services disabled. Enable GPS.');
       return;
     }
 
-    LocationPermission permission = await Geolocator.checkPermission();
-    if (permission == LocationPermission.denied) {
-      permission = await Geolocator.requestPermission();
-      if (permission == LocationPermission.denied) {
+    var perm = await Geolocator.checkPermission();
+    if (perm == LocationPermission.denied) {
+      perm = await Geolocator.requestPermission();
+      if (perm == LocationPermission.denied) {
         _showSnackBar('Location permission denied');
         return;
       }
     }
-    if (permission == LocationPermission.deniedForever) {
-      _showSnackBar('Location permission permanently denied.');
+    if (perm == LocationPermission.deniedForever) {
+      _showSnackBar('Permission denied. Opening settings...');
       await Geolocator.openAppSettings();
       return;
     }
 
-    // Request "Always" permission for background collection
-    if (permission == LocationPermission.whileInUse) {
-      _showSnackBar('Background location needed. Please select "Allow all the time" in the next dialog.');
-      // On Android, this opens the app settings where user can change to "Always"
-      permission = await Geolocator.requestPermission();
-      if (permission == LocationPermission.whileInUse) {
-        // Still only "while in use" — open settings manually
-        await Geolocator.openAppSettings();
-        _showSnackBar('Please select "Allow all the time" in app settings, then tap Start again.');
-        return;
-      }
+    // Notification permission (Android 13+)
+    final notifPerm = await FlutterForegroundTask.checkNotificationPermission();
+    if (notifPerm != NotificationPermission.granted) {
+      await FlutterForegroundTask.requestNotificationPermission();
     }
 
-    if (permission == LocationPermission.deniedForever) {
-      _showSnackBar('Location permission permanently denied. Enable in settings.');
-      return;
-    }
+    // Re-init with selected interval
+    _initForegroundTask();
 
-    // Initialize privacy processor for demo
-    _privacyProcessor = createPrivacyProcessor(
-      config: PrivacyConfig(gridSeed: 'demo-user-${DateTime.now().millisecondsSinceEpoch}'),
+    // Start service
+    final result = await FlutterForegroundTask.startService(
+      serviceId: 256,
+      notificationTitle: 'Zairn Trace',
+      notificationText: 'Recording every ${_intervalSeconds}s...',
+      callback: startCallback,
     );
 
-    setState(() => _isCollecting = true);
-
-    // Start watching position
-    _positionSubscription = Geolocator.getPositionStream(
-      locationSettings: const LocationSettings(
-        accuracy: LocationAccuracy.high,
-        distanceFilter: 0,
-      ),
-    ).listen((position) {
-      _lastPosition = position;
-    });
-
-    // Record at fixed interval
-    _recordPoint();
-    _timer = Timer.periodic(Duration(seconds: _intervalSeconds), (_) => _recordPoint());
-
-    _showSnackBar('Started collecting (every ${_intervalSeconds}s)');
+    if (result is ServiceRequestSuccess) {
+      setState(() => _isCollecting = true);
+      _showSnackBar('Recording (background service, every ${_intervalSeconds}s)');
+    } else {
+      _showSnackBar('Failed to start service: $result');
+    }
   }
 
-  void _stop() {
-    _positionSubscription?.cancel();
-    _positionSubscription = null;
-    _timer?.cancel();
-    _timer = null;
+  Future<void> _stop() async {
+    await FlutterForegroundTask.stopService();
     setState(() => _isCollecting = false);
   }
 
-  void _recordPoint() {
-    final pos = _lastPosition;
-    if (pos == null) return;
-
-    final now = DateTime.now();
-    final point = {
-      'lat': double.parse(pos.latitude.toStringAsFixed(7)),
-      'lon': double.parse(pos.longitude.toStringAsFixed(7)),
-      'accuracy': pos.accuracy.round(),
-      'speed': pos.speed,
-      'altitude': pos.altitude,
-      'timestamp': now.toIso8601String(),
-      'hour': now.hour,
-      'ts': now.millisecondsSinceEpoch,
-    };
-
-    // Run through privacy processor for demo
-    if (_privacyProcessor != null) {
-      _lastPrivacyState = _privacyProcessor!.process(pos.latitude, pos.longitude);
-    }
-
-    setState(() {
-      _trace.add(point);
-    });
-    _saveTrace();
-  }
-
   Future<void> _export() async {
-    if (_trace.isEmpty) {
-      _showSnackBar('No data to export');
-      return;
-    }
+    if (_trace.isEmpty) { _showSnackBar('No data'); return; }
 
     final meta = {
       'device': Platform.operatingSystem,
@@ -200,26 +230,22 @@ class _TraceCollectorPageState extends State<TraceCollectorPage> {
       'durationHours': ((_trace.last['ts'] - _trace.first['ts']) / 3600000).toStringAsFixed(1),
       'intervalSeconds': _intervalSeconds,
     };
-
     final data = jsonEncode({'meta': meta, 'trace': _trace});
-    final dateStr = DateFormat('yyyy-MM-dd').format(DateTime.now());
-    final filename = 'dense-trace-$dateStr.json';
+    final filename = 'dense-trace-${DateFormat('yyyy-MM-dd').format(DateTime.now())}.json';
 
-    // Save to downloads or share
-    // For simplicity, copy to clipboard description
-    _showSnackBar('${_trace.length} points ready. File: $filename (${(data.length / 1024).toStringAsFixed(1)} KB)');
-
-    // Write to app documents directory
-    final dir = Directory('/storage/emulated/0/Download');
-    if (await dir.exists()) {
-      final file = File('${dir.path}/$filename');
-      await file.writeAsString(data);
-      _showSnackBar('Saved to Downloads/$filename');
+    try {
+      final dir = Directory('/storage/emulated/0/Download');
+      if (await dir.exists()) {
+        await File('${dir.path}/$filename').writeAsString(data);
+        _showSnackBar('Saved: Downloads/$filename (${(data.length / 1024).toStringAsFixed(0)} KB)');
+      }
+    } catch (e) {
+      _showSnackBar('Export error: $e');
     }
   }
 
   Future<void> _clear() async {
-    final confirmed = await showDialog<bool>(
+    final ok = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
         title: const Text('Clear all data?'),
@@ -230,210 +256,105 @@ class _TraceCollectorPageState extends State<TraceCollectorPage> {
         ],
       ),
     );
-    if (confirmed != true) return;
-
+    if (ok != true) return;
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove(_storageKey);
-    setState(() {
-      _trace = [];
-      _lastPrivacyState = null;
-    });
+    setState(() { _trace = []; _lastPrivacyState = null; });
   }
 
-  void _showSnackBar(String message) {
+  void _showSnackBar(String msg) {
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
   }
 
   String _formatDuration() {
     if (_trace.length < 2) return '0h';
     final ms = _trace.last['ts'] - _trace.first['ts'];
-    final hours = ms / 3600000;
-    if (hours < 1) return '${(ms / 60000).round()}m';
-    return '${hours.toStringAsFixed(1)}h';
+    return ms < 3600000 ? '${(ms / 60000).round()}m' : '${(ms / 3600000).toStringAsFixed(1)}h';
   }
 
-  String _privacyStateLabel(LocationState? state) {
-    if (state == null) return '-';
-    return switch (state) {
-      CoarseLocation(cellId: final id) => 'Coarse: $id',
-      StateOnly(label: final l) => 'State: $l',
-      ProximityBucket(bucket: final b) => 'Proximity: $b',
-      Suppressed(reason: final r) => 'Suppressed: $r',
-      PreciseLocation() => 'Precise',
-    };
-  }
+  String _stateLabel(LocationState? s) => switch (s) {
+    null => '-',
+    CoarseLocation(cellId: final id) => 'Coarse: $id',
+    StateOnly(label: final l) => 'State: $l',
+    ProximityBucket(bucket: final b) => 'Proximity: $b',
+    Suppressed(reason: final r) => 'Suppressed: $r',
+    PreciseLocation() => 'Precise',
+  };
 
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-
+    final t = Theme.of(context);
     return Scaffold(
       appBar: AppBar(
         title: const Text('Zairn Trace Collector'),
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.delete_outline),
-            onPressed: _trace.isEmpty ? null : _clear,
-          ),
-        ],
+        actions: [IconButton(icon: const Icon(Icons.delete_outline), onPressed: _trace.isEmpty ? null : _clear)],
       ),
       body: Padding(
         padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            // Status card
-            Card(
-              color: _isCollecting
-                  ? theme.colorScheme.primaryContainer
-                  : theme.colorScheme.surfaceContainerHighest,
-              child: Padding(
-                padding: const EdgeInsets.all(16),
-                child: Column(
-                  children: [
-                    Icon(
-                      _isCollecting ? Icons.my_location : Icons.location_off,
-                      size: 48,
-                      color: _isCollecting
-                          ? theme.colorScheme.primary
-                          : theme.colorScheme.outline,
-                    ),
-                    const SizedBox(height: 8),
-                    Text(
-                      _isCollecting ? 'Collecting...' : 'Stopped',
-                      style: theme.textTheme.titleLarge,
-                    ),
-                    const SizedBox(height: 4),
-                    Text(
-                      '${_trace.length} points | ${_formatDuration()} | '
-                      '${(_trace.length * 50 / 1024).toStringAsFixed(1)} KB',
-                      style: theme.textTheme.bodyMedium,
-                    ),
-                  ],
-                ),
-              ),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          Card(
+            color: _isCollecting ? t.colorScheme.primaryContainer : t.colorScheme.surfaceContainerHighest,
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(children: [
+                Icon(_isCollecting ? Icons.my_location : Icons.location_off, size: 48,
+                    color: _isCollecting ? t.colorScheme.primary : t.colorScheme.outline),
+                const SizedBox(height: 8),
+                Text(_isCollecting ? 'Recording (background)' : 'Stopped', style: t.textTheme.titleLarge),
+                const SizedBox(height: 4),
+                Text('${_trace.length} points | ${_formatDuration()}', style: t.textTheme.bodyMedium),
+              ]),
             ),
-
-            const SizedBox(height: 16),
-
-            // Interval selector
-            Row(
-              children: [
-                const Text('Interval: '),
-                ChoiceChip(
-                  label: const Text('30s'),
-                  selected: _intervalSeconds == 30,
-                  onSelected: _isCollecting ? null : (_) => setState(() => _intervalSeconds = 30),
-                ),
-                const SizedBox(width: 8),
-                ChoiceChip(
-                  label: const Text('1m'),
-                  selected: _intervalSeconds == 60,
-                  onSelected: _isCollecting ? null : (_) => setState(() => _intervalSeconds = 60),
-                ),
-                const SizedBox(width: 8),
-                ChoiceChip(
-                  label: const Text('5m'),
-                  selected: _intervalSeconds == 300,
-                  onSelected: _isCollecting ? null : (_) => setState(() => _intervalSeconds = 300),
-                ),
-              ],
-            ),
-
-            const SizedBox(height: 16),
-
-            // Privacy state demo
-            if (_lastPosition != null) ...[
-              Card(
-                child: Padding(
-                  padding: const EdgeInsets.all(12),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text('Last GPS', style: theme.textTheme.labelLarge),
-                      Text(
-                        '${_lastPosition!.latitude.toStringAsFixed(6)}, '
-                        '${_lastPosition!.longitude.toStringAsFixed(6)} '
-                        '(${_lastPosition!.accuracy.round()}m)',
-                      ),
-                      const SizedBox(height: 4),
-                      Text('Privacy output', style: theme.textTheme.labelLarge),
-                      Text(_privacyStateLabel(_lastPrivacyState)),
-                    ],
-                  ),
-                ),
+          ),
+          const SizedBox(height: 12),
+          Row(children: [
+            const Text('Interval: '),
+            for (final s in [30, 60, 300]) ...[
+              ChoiceChip(
+                label: Text(s < 60 ? '${s}s' : '${s ~/ 60}m'),
+                selected: _intervalSeconds == s,
+                onSelected: _isCollecting ? null : (_) => setState(() => _intervalSeconds = s),
               ),
-              const SizedBox(height: 16),
+              const SizedBox(width: 6),
             ],
-
-            // Buttons
-            Row(
-              children: [
-                Expanded(
-                  child: FilledButton.icon(
-                    onPressed: _isCollecting ? null : _start,
-                    icon: const Icon(Icons.play_arrow),
-                    label: const Text('Start'),
-                  ),
-                ),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: OutlinedButton.icon(
-                    onPressed: _isCollecting ? _stop : null,
-                    icon: const Icon(Icons.stop),
-                    label: const Text('Stop'),
-                  ),
-                ),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: FilledButton.tonalIcon(
-                    onPressed: _trace.isEmpty ? null : _export,
-                    icon: const Icon(Icons.download),
-                    label: const Text('Export'),
-                  ),
-                ),
-              ],
-            ),
-
-            const SizedBox(height: 16),
-
-            // Recent points
-            Text('Recent points', style: theme.textTheme.titleSmall),
-            const SizedBox(height: 8),
-            Expanded(
-              child: _trace.isEmpty
-                  ? Center(
-                      child: Text(
-                        'No data yet. Tap Start to begin collecting.',
-                        style: theme.textTheme.bodyLarge?.copyWith(
-                          color: theme.colorScheme.outline,
-                        ),
-                      ),
-                    )
-                  : ListView.builder(
-                      reverse: true,
-                      itemCount: _trace.length,
-                      itemBuilder: (ctx, i) {
-                        final idx = _trace.length - 1 - i;
-                        final p = _trace[idx];
-                        final time = DateFormat('HH:mm:ss').format(
-                          DateTime.parse(p['timestamp'] as String),
-                        );
-                        return ListTile(
-                          dense: true,
-                          leading: Text('#${idx + 1}', style: theme.textTheme.bodySmall),
-                          title: Text(
-                            '${p['lat']}, ${p['lon']}',
-                            style: theme.textTheme.bodyMedium,
-                          ),
-                          subtitle: Text('$time | ${p['accuracy']}m'),
-                        );
-                      },
-                    ),
-            ),
-          ],
-        ),
+          ]),
+          const SizedBox(height: 12),
+          if (_trace.isNotEmpty)
+            Card(child: Padding(
+              padding: const EdgeInsets.all(12),
+              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Text('Last: ${_trace.last['lat']}, ${_trace.last['lon']} (${_trace.last['accuracy']}m)', style: t.textTheme.bodySmall),
+                Text('Privacy: ${_stateLabel(_lastPrivacyState)}', style: t.textTheme.bodySmall),
+              ]),
+            )),
+          const SizedBox(height: 12),
+          Row(children: [
+            Expanded(child: FilledButton.icon(onPressed: _isCollecting ? null : _start, icon: const Icon(Icons.play_arrow), label: const Text('Start'))),
+            const SizedBox(width: 8),
+            Expanded(child: OutlinedButton.icon(onPressed: _isCollecting ? _stop : null, icon: const Icon(Icons.stop), label: const Text('Stop'))),
+            const SizedBox(width: 8),
+            Expanded(child: FilledButton.tonalIcon(onPressed: _trace.isEmpty ? null : _export, icon: const Icon(Icons.download), label: const Text('Export'))),
+          ]),
+          const SizedBox(height: 12),
+          Text('Recent', style: t.textTheme.titleSmall),
+          Expanded(
+            child: _trace.isEmpty
+                ? Center(child: Text('Tap Start to begin.', style: t.textTheme.bodyLarge?.copyWith(color: t.colorScheme.outline)))
+                : ListView.builder(
+                    reverse: true,
+                    itemCount: _trace.length,
+                    itemBuilder: (_, i) {
+                      final p = _trace[_trace.length - 1 - i];
+                      return ListTile(
+                        dense: true,
+                        leading: Text('#${_trace.length - i}', style: t.textTheme.bodySmall),
+                        title: Text('${p['lat']}, ${p['lon']}'),
+                        subtitle: Text('${DateFormat('HH:mm:ss').format(DateTime.parse(p['timestamp'] as String))} | ${p['accuracy']}m'),
+                      );
+                    }),
+          ),
+        ]),
       ),
     );
   }
