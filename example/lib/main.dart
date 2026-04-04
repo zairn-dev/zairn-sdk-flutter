@@ -267,9 +267,9 @@ class _TraceCollectorPageState extends State<TraceCollectorPage> with WidgetsBin
       final data = jsonEncode({'meta': meta, 'trace': trace});
       final filename = 'dense-trace-${DateFormat('yyyy-MM-dd-HHmm').format(DateTime.now())}.json';
 
-      // Save to temp file for sharing
-      final dir = await getApplicationDocumentsDirectory();
-      final exportFile = File('${dir.path}/$filename');
+      // Save to temp directory (accessible by share sheet on all platforms)
+      final tmpDir = await getTemporaryDirectory();
+      final exportFile = File('${tmpDir.path}/$filename');
       await exportFile.writeAsString(data);
 
       // Android: also save to Downloads
@@ -278,15 +278,14 @@ class _TraceCollectorPageState extends State<TraceCollectorPage> with WidgetsBin
           final dlDir = Directory('/storage/emulated/0/Download');
           if (await dlDir.exists()) {
             await File('${dlDir.path}/$filename').writeAsString(data);
+            _showSnackBar('Also saved to Downloads/$filename');
           }
         } catch (_) {}
       }
 
-      // Open share sheet (works on both iOS and Android)
+      // Open share sheet
       await Share.shareXFiles(
-        [XFile(exportFile.path)],
-        subject: filename,
-        text: '${trace.length} GPS points, ${(data.length / 1024).toStringAsFixed(0)} KB',
+        [XFile(exportFile.path, mimeType: 'application/json')],
       );
     } catch (e) {
       _showSnackBar('Export error: $e');
