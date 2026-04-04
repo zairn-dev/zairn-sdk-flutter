@@ -364,6 +364,16 @@ class _TraceCollectorPageState extends State<TraceCollectorPage> with WidgetsBin
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
   }
 
+  String _formatTimestamp(dynamic ts) {
+    try {
+      if (ts is String) return DateFormat('HH:mm:ss').format(DateTime.parse(ts));
+      if (ts is num) return DateFormat('HH:mm:ss').format(DateTime.fromMillisecondsSinceEpoch(ts.toInt()));
+      return ts.toString();
+    } catch (_) {
+      return '?';
+    }
+  }
+
   String _stateLabel(LocationState? s) => switch (s) {
     null => '-',
     CoarseLocation(cellId: final id) => 'Coarse: $id',
@@ -418,7 +428,7 @@ class _TraceCollectorPageState extends State<TraceCollectorPage> with WidgetsBin
                 Text('Last: ${_lastPoint!['lat']}, ${_lastPoint!['lon']} (${_lastPoint!['accuracy']}m)', style: t.textTheme.bodySmall),
                 Text('Privacy: ${_stateLabel(_lastPrivacyState)}', style: t.textTheme.bodySmall),
                 if (_lastPoint!['timestamp'] != null)
-                  Text('Time: ${DateFormat('HH:mm:ss').format(DateTime.parse(_lastPoint!['timestamp'] as String))}', style: t.textTheme.bodySmall),
+                  Text('Time: ${_formatTimestamp(_lastPoint!['timestamp'])}', style: t.textTheme.bodySmall),
               ]),
             )),
           const SizedBox(height: 12),
