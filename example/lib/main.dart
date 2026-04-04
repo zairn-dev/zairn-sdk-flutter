@@ -88,7 +88,7 @@ class TraceCollectorPage extends StatefulWidget {
   State<TraceCollectorPage> createState() => _TraceCollectorPageState();
 }
 
-class _TraceCollectorPageState extends State<TraceCollectorPage> {
+class _TraceCollectorPageState extends State<TraceCollectorPage> with WidgetsBindingObserver {
   static const _storageKey = 'dense_trace_data';
 
   bool _isCollecting = false;
@@ -108,6 +108,7 @@ class _TraceCollectorPageState extends State<TraceCollectorPage> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _loadTrace();
     if (_isAndroid) {
       _initAndroidForegroundTask();
@@ -117,8 +118,17 @@ class _TraceCollectorPageState extends State<TraceCollectorPage> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _stopIos();
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      // Reload data when coming back to foreground
+      _loadTrace();
+    }
   }
 
   // =====================
@@ -155,14 +165,19 @@ class _TraceCollectorPageState extends State<TraceCollectorPage> {
   // =====================
 
   void _addPoint(Map<String, dynamic> point) {
-    _privacyProcessor ??= createPrivacyProcessor(
-      config: PrivacyConfig(gridSeed: 'trace-collector'),
-    );
-    final lat = (point['lat'] as num).toDouble();
-    final lon = (point['lon'] as num).toDouble();
-    _lastPrivacyState = _privacyProcessor!.process(lat, lon);
-    setState(() => _trace.add(point));
-    _saveTrace();
+    try {
+      _privacyProcessor ??= createPrivacyProcessor(
+        config: PrivacyConfig(gridSeed: 'trace-collector'),
+      );
+      final lat = (point['lat'] as num).toDouble();
+      final lon = (point['lon'] as num).toDouble();
+      _lastPrivacyState = _privacyProcessor!.process(lat, lon);
+      _trace.add(point);
+      _saveTrace();
+      if (mounted) setState(() {});
+    } catch (_) {
+      // Silently ignore errors during background/foreground transitions
+    }
   }
 
   Future<void> _loadTrace() async {
@@ -258,10 +273,11 @@ class _TraceCollectorPageState extends State<TraceCollectorPage> {
   }
 
   void _recordIosPoint() {
-    final pos = _iosLastPos;
-    if (pos == null) return;
-    final now = DateTime.now();
-    _addPoint({
+    try {
+      final pos = _iosLastPos;
+      if (pos == null) return;
+      final now = DateTime.now();
+      _addPoint({
       'lat': double.parse(pos.latitude.toStringAsFixed(7)),
       'lon': double.parse(pos.longitude.toStringAsFixed(7)),
       'accuracy': pos.accuracy.round(),
@@ -271,6 +287,7 @@ class _TraceCollectorPageState extends State<TraceCollectorPage> {
       'hour': now.hour,
       'ts': now.millisecondsSinceEpoch,
     });
+    } catch (_) {}
   }
 
   Future<void> _stop() async {
