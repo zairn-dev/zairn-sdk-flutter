@@ -92,8 +92,13 @@ class _TraceCollectorPageState extends State<TraceCollectorPage> with WidgetsBin
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.resumed && mounted) {
-      setState(() {}); // Refresh UI
+    if (state == AppLifecycleState.resumed) {
+      // Delay UI refresh to let iOS finish any pending work
+      Future.delayed(const Duration(milliseconds: 500), () {
+        if (mounted) {
+          _initTraceFile(); // Reload point count from file
+        }
+      });
     }
   }
 
@@ -201,7 +206,11 @@ class _TraceCollectorPageState extends State<TraceCollectorPage> with WidgetsBin
     );
   }
 
+  bool _iosFetching = false;
+
   Future<void> _fetchAndRecordIos() async {
+    if (_iosFetching) return; // Prevent overlapping calls
+    _iosFetching = true;
     try {
       final pos = await Geolocator.getCurrentPosition(
         locationSettings: AppleSettings(
@@ -215,6 +224,8 @@ class _TraceCollectorPageState extends State<TraceCollectorPage> with WidgetsBin
       _recordPoint(pos);
     } catch (e) {
       debugPrint('iOS GPS error: $e');
+    } finally {
+      _iosFetching = false;
     }
   }
 
