@@ -63,8 +63,7 @@ class _TraceCollectorPageState extends State<TraceCollectorPage> with WidgetsBin
   Map<String, dynamic>? _lastPoint;
 
   StreamSubscription<Position>? _posStream;
-  Timer? _timer;
-  Position? _lastPosition;
+  int _lastRecordedTs = 0;
 
   PrivacyProcessor? _privacyProcessor;
   LocationState? _lastPrivacyState;
@@ -154,10 +153,13 @@ class _TraceCollectorPageState extends State<TraceCollectorPage> with WidgetsBin
           : const LocationSettings(accuracy: LocationAccuracy.high, distanceFilter: 0);
 
       _posStream = Geolocator.getPositionStream(locationSettings: locationSettings)
-          .listen((pos) => _lastPosition = pos);
-
-      _recordPoint(); // first point immediately
-      _timer = Timer.periodic(Duration(seconds: _intervalSeconds), (_) => _recordPoint());
+          .listen((pos) {
+        // Throttle: only record if enough time has passed
+        final now = DateTime.now().millisecondsSinceEpoch;
+        if (now - _lastRecordedTs >= _intervalSeconds * 1000) {
+          _recordPoint(pos);
+        }
+      });
 
       setState(() => _isCollecting = true);
       _showSnackBar('Recording every ${_intervalSeconds}s');
@@ -196,12 +198,10 @@ class _TraceCollectorPageState extends State<TraceCollectorPage> with WidgetsBin
     );
   }
 
-  void _recordPoint() {
+  void _recordPoint(Position pos) {
     try {
-      final pos = _lastPosition;
-      if (pos == null) return;
-
       final now = DateTime.now();
+      _lastRecordedTs = now.millisecondsSinceEpoch;
       final point = {
         'lat': double.parse(pos.latitude.toStringAsFixed(7)),
         'lon': double.parse(pos.longitude.toStringAsFixed(7)),
@@ -236,8 +236,6 @@ class _TraceCollectorPageState extends State<TraceCollectorPage> with WidgetsBin
   Future<void> _stop() async {
     _posStream?.cancel();
     _posStream = null;
-    _timer?.cancel();
-    _timer = null;
     if (Platform.isAndroid) {
       await FlutterForegroundTask.stopService();
     }
