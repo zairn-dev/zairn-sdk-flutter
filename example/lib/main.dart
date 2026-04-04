@@ -209,52 +209,68 @@ class _TraceCollectorPageState extends State<TraceCollectorPage> with WidgetsBin
   Future<void> _start() async {
     if (_isCollecting) return;
 
-    if (!await Geolocator.isLocationServiceEnabled()) {
-      _showSnackBar('Location services disabled. Enable GPS.');
-      return;
-    }
-
-    var perm = await Geolocator.checkPermission();
-    if (perm == LocationPermission.denied) {
-      perm = await Geolocator.requestPermission();
-      if (perm == LocationPermission.denied) {
-        _showSnackBar('Location permission denied');
+    try {
+      final serviceEnabled = await Geolocator.isLocationServiceEnabled();
+      if (!serviceEnabled) {
+        _showSnackBar('Location services disabled. Enable GPS.');
         return;
       }
-    }
-    if (perm == LocationPermission.deniedForever) {
-      _showSnackBar('Permission denied. Opening settings...');
-      await Geolocator.openAppSettings();
-      return;
-    }
 
-    if (_isAndroid) {
-      await _startAndroid();
-    } else {
-      await _startIos();
+      var perm = await Geolocator.checkPermission();
+      _showSnackBar('Current permission: $perm');
+
+      if (perm == LocationPermission.denied) {
+        perm = await Geolocator.requestPermission();
+        if (perm == LocationPermission.denied) {
+          _showSnackBar('Location permission denied');
+          return;
+        }
+      }
+      if (perm == LocationPermission.deniedForever) {
+        _showSnackBar('Permission denied. Opening settings...');
+        await Geolocator.openAppSettings();
+        return;
+      }
+
+      if (_isAndroid) {
+        await _startAndroid();
+      } else {
+        await _startIos();
+      }
+    } catch (e) {
+      _showSnackBar('Start error: $e');
+      debugPrint('Start error: $e');
     }
   }
 
   Future<void> _startAndroid() async {
-    final notifPerm = await FlutterForegroundTask.checkNotificationPermission();
-    if (notifPerm != NotificationPermission.granted) {
-      await FlutterForegroundTask.requestNotificationPermission();
-    }
+    try {
+      final notifPerm = await FlutterForegroundTask.checkNotificationPermission();
+      _showSnackBar('Notification permission: $notifPerm');
+      if (notifPerm != NotificationPermission.granted) {
+        await FlutterForegroundTask.requestNotificationPermission();
+      }
 
-    _initAndroidForegroundTask();
+      _initAndroidForegroundTask();
 
-    final result = await FlutterForegroundTask.startService(
-      serviceId: 256,
-      notificationTitle: 'Zairn Trace',
-      notificationText: 'Recording every ${_intervalSeconds}s...',
-      callback: startCallback,
-    );
+      _showSnackBar('Starting foreground service...');
+      final result = await FlutterForegroundTask.startService(
+        serviceId: 256,
+        notificationTitle: 'Zairn Trace',
+        notificationText: 'Recording every ${_intervalSeconds}s...',
+        callback: startCallback,
+      );
 
-    if (result is ServiceRequestSuccess) {
-      setState(() => _isCollecting = true);
-      _showSnackBar('Recording (background service)');
-    } else {
-      _showSnackBar('Failed to start service');
+      _showSnackBar('Service result: $result (${result.runtimeType})');
+      if (result is ServiceRequestSuccess) {
+        setState(() => _isCollecting = true);
+        _showSnackBar('Recording (background service active)');
+      } else {
+        _showSnackBar('Failed: $result');
+      }
+    } catch (e) {
+      _showSnackBar('Android start error: $e');
+      debugPrint('Android start error: $e');
     }
   }
 
