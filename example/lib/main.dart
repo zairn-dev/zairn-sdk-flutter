@@ -7,6 +7,7 @@ import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:intl/intl.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:share_plus/share_plus.dart';
 import 'package:zairn_sdk/zairn_sdk.dart';
 
 // ============================================================
@@ -252,32 +253,41 @@ class _TraceCollectorPageState extends State<TraceCollectorPage> with WidgetsBin
       return;
     }
 
-    final lines = await _traceFile!.readAsLines();
-    final trace = lines.map((l) { try { return jsonDecode(l); } catch (_) { return null; } }).whereType<Map<String, dynamic>>().toList();
-
-    final meta = {
-      'device': '${Platform.operatingSystem} ${Platform.operatingSystemVersion}',
-      'points': trace.length,
-      'startTime': trace.isNotEmpty ? trace.first['timestamp'] : null,
-      'endTime': trace.isNotEmpty ? trace.last['timestamp'] : null,
-      'intervalSeconds': _intervalSeconds,
-    };
-    final data = jsonEncode({'meta': meta, 'trace': trace});
-    final filename = 'dense-trace-${DateFormat('yyyy-MM-dd-HHmm').format(DateTime.now())}.json';
-
     try {
-      if (Platform.isAndroid) {
-        final dir = Directory('/storage/emulated/0/Download');
-        if (await dir.exists()) {
-          await File('${dir.path}/$filename').writeAsString(data);
-          _showSnackBar('Saved: Downloads/$filename');
-          return;
-        }
-      }
-      // iOS / fallback: save to documents
+      final lines = await _traceFile!.readAsLines();
+      final trace = lines.map((l) { try { return jsonDecode(l); } catch (_) { return null; } }).whereType<Map<String, dynamic>>().toList();
+
+      final meta = {
+        'device': '${Platform.operatingSystem} ${Platform.operatingSystemVersion}',
+        'points': trace.length,
+        'startTime': trace.isNotEmpty ? trace.first['timestamp'] : null,
+        'endTime': trace.isNotEmpty ? trace.last['timestamp'] : null,
+        'intervalSeconds': _intervalSeconds,
+      };
+      final data = jsonEncode({'meta': meta, 'trace': trace});
+      final filename = 'dense-trace-${DateFormat('yyyy-MM-dd-HHmm').format(DateTime.now())}.json';
+
+      // Save to temp file for sharing
       final dir = await getApplicationDocumentsDirectory();
-      await File('${dir.path}/$filename').writeAsString(data);
-      _showSnackBar('Saved: ${dir.path}/$filename (${(data.length / 1024).toStringAsFixed(0)} KB)');
+      final exportFile = File('${dir.path}/$filename');
+      await exportFile.writeAsString(data);
+
+      // Android: also save to Downloads
+      if (Platform.isAndroid) {
+        try {
+          final dlDir = Directory('/storage/emulated/0/Download');
+          if (await dlDir.exists()) {
+            await File('${dlDir.path}/$filename').writeAsString(data);
+          }
+        } catch (_) {}
+      }
+
+      // Open share sheet (works on both iOS and Android)
+      await Share.shareXFiles(
+        [XFile(exportFile.path)],
+        subject: filename,
+        text: '${trace.length} GPS points, ${(data.length / 1024).toStringAsFixed(0)} KB',
+      );
     } catch (e) {
       _showSnackBar('Export error: $e');
     }
