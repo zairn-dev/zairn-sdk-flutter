@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:intl/intl.dart';
@@ -66,8 +67,10 @@ class _TraceCollectorPageState extends State<TraceCollectorPage> with WidgetsBin
   StreamSubscription<Position>? _posStream;
   int _lastRecordedTs = 0;
 
-  // iOS: periodic getCurrentPosition (no long-lived stream)
-  Timer? _iosTimer;
+  // iOS: native CLLocationManager via platform channel
+  static const _iosChannel = MethodChannel('zairn/ios_location');
+  static const _iosEvents = EventChannel('zairn/ios_location_events');
+  StreamSubscription? _iosEventSub;
 
   PrivacyProcessor? _privacyProcessor;
   LocationState? _lastPrivacyState;
@@ -86,7 +89,7 @@ class _TraceCollectorPageState extends State<TraceCollectorPage> with WidgetsBin
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _posStream?.cancel();
-    _iosTimer?.cancel();
+    _iosEventSub?.cancel();
     super.dispose();
   }
 
@@ -161,12 +164,29 @@ class _TraceCollectorPageState extends State<TraceCollectorPage> with WidgetsBin
           }
         });
       } else {
-        // iOS: periodic getCurrentPosition (no long-lived stream = no memory leak)
-        // First point immediately
-        _fetchAndRecordIos();
-        _iosTimer = Timer.periodic(Duration(seconds: _intervalSeconds), (_) {
-          _fetchAndRecordIos();
+        // iOS: native CLLocationManager (no Flutter Timer, no stream)
+        _iosEventSub = _iosEvents.receiveBroadcastStream().listen((data) {
+          if (data is Map) {
+            try {
+              final pos = Position(
+                latitude: (data['latitude'] as num).toDouble(),
+                longitude: (data['longitude'] as num).toDouble(),
+                accuracy: (data['accuracy'] as num).toDouble(),
+                speed: (data['speed'] as num?)?.toDouble() ?? 0,
+                altitude: (data['altitude'] as num?)?.toDouble() ?? 0,
+                heading: (data['heading'] as num?)?.toDouble() ?? 0,
+                timestamp: DateTime.fromMillisecondsSinceEpoch((data['timestamp'] as num).toInt()),
+                altitudeAccuracy: 0,
+                headingAccuracy: 0,
+                speedAccuracy: 0,
+              );
+              _recordPoint(pos);
+            } catch (e) {
+              debugPrint('iOS event parse error: $e');
+            }
+          }
         });
+        await _iosChannel.invokeMethod('start', {'intervalSeconds': _intervalSeconds});
       }
 
       setState(() => _isCollecting = true);
@@ -204,29 +224,6 @@ class _TraceCollectorPageState extends State<TraceCollectorPage> with WidgetsBin
       notificationText: 'Recording...',
       callback: startCallback,
     );
-  }
-
-  bool _iosFetching = false;
-
-  Future<void> _fetchAndRecordIos() async {
-    if (_iosFetching) return; // Prevent overlapping calls
-    _iosFetching = true;
-    try {
-      final pos = await Geolocator.getCurrentPosition(
-        locationSettings: AppleSettings(
-          accuracy: LocationAccuracy.high,
-          allowBackgroundLocationUpdates: true,
-          showBackgroundLocationIndicator: true,
-          pauseLocationUpdatesAutomatically: false,
-          activityType: ActivityType.other,
-        ),
-      );
-      _recordPoint(pos);
-    } catch (e) {
-      debugPrint('iOS GPS error: $e');
-    } finally {
-      _iosFetching = false;
-    }
   }
 
   void _recordPoint(Position pos) {
@@ -267,8 +264,11 @@ class _TraceCollectorPageState extends State<TraceCollectorPage> with WidgetsBin
   Future<void> _stop() async {
     _posStream?.cancel();
     _posStream = null;
-    _iosTimer?.cancel();
-    _iosTimer = null;
+    _iosEventSub?.cancel();
+    _iosEventSub = null;
+    if (Platform.isIOS) {
+      try { await _iosChannel.invokeMethod('stop'); } catch (_) {}
+    }
     if (Platform.isAndroid) {
       await FlutterForegroundTask.stopService();
     }
