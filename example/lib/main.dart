@@ -10,7 +10,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:zairn_sdk/zairn_sdk.dart';
 
 // ============================================================
-// Foreground task handler (runs as Android foreground service)
+// Android: Foreground task handler (runs as foreground service)
 // ============================================================
 
 @pragma('vm:entry-point')
@@ -29,18 +29,15 @@ class LocationTaskHandler extends TaskHandler {
         accuracy: LocationAccuracy.high,
         distanceFilter: 0,
       ),
-    ).listen((pos) {
-      _lastPos = pos;
-    });
+    ).listen((pos) => _lastPos = pos);
   }
 
   @override
   void onRepeatEvent(DateTime timestamp) {
     final pos = _lastPos;
     if (pos == null) return;
-
     final now = DateTime.now();
-    final point = {
+    FlutterForegroundTask.sendDataToMain({
       'lat': double.parse(pos.latitude.toStringAsFixed(7)),
       'lon': double.parse(pos.longitude.toStringAsFixed(7)),
       'accuracy': pos.accuracy.round(),
@@ -49,12 +46,10 @@ class LocationTaskHandler extends TaskHandler {
       'timestamp': now.toIso8601String(),
       'hour': now.hour,
       'ts': now.millisecondsSinceEpoch,
-    };
-
-    FlutterForegroundTask.sendDataToMain(point);
+    });
     FlutterForegroundTask.updateService(
       notificationTitle: 'Zairn Trace',
-      notificationText: '${pos.latitude.toStringAsFixed(4)}, ${pos.longitude.toStringAsFixed(4)} | ${DateFormat('HH:mm').format(now)}',
+      notificationText: '${pos.latitude.toStringAsFixed(4)}, ${pos.longitude.toStringAsFixed(4)}',
     );
   }
 
@@ -68,13 +63,10 @@ class LocationTaskHandler extends TaskHandler {
 // App
 // ============================================================
 
-void main() {
-  runApp(const ZairnExampleApp());
-}
+void main() => runApp(const ZairnExampleApp());
 
 class ZairnExampleApp extends StatelessWidget {
   const ZairnExampleApp({super.key});
-
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
@@ -92,7 +84,6 @@ class ZairnExampleApp extends StatelessWidget {
 
 class TraceCollectorPage extends StatefulWidget {
   const TraceCollectorPage({super.key});
-
   @override
   State<TraceCollectorPage> createState() => _TraceCollectorPageState();
 }
@@ -104,30 +95,46 @@ class _TraceCollectorPageState extends State<TraceCollectorPage> {
   List<Map<String, dynamic>> _trace = [];
   int _intervalSeconds = 60;
 
+  // iOS: direct stream + timer
+  StreamSubscription<Position>? _iosPosStream;
+  Timer? _iosTimer;
+  Position? _iosLastPos;
+
   PrivacyProcessor? _privacyProcessor;
   LocationState? _lastPrivacyState;
+
+  bool get _isAndroid => Platform.isAndroid;
 
   @override
   void initState() {
     super.initState();
     _loadTrace();
-    _initForegroundTask();
-    FlutterForegroundTask.addTaskDataCallback(_onDataFromTask);
+    if (_isAndroid) {
+      _initAndroidForegroundTask();
+      FlutterForegroundTask.addTaskDataCallback(_onDataFromTask);
+    }
   }
 
-  void _initForegroundTask() {
+  @override
+  void dispose() {
+    _stopIos();
+    super.dispose();
+  }
+
+  // =====================
+  // Android foreground service setup
+  // =====================
+
+  void _initAndroidForegroundTask() {
     FlutterForegroundTask.init(
       androidNotificationOptions: AndroidNotificationOptions(
         channelId: 'zairn_trace',
         channelName: 'Zairn Trace Collector',
-        channelDescription: 'GPS trace collection for research',
+        channelDescription: 'GPS trace collection',
         channelImportance: NotificationChannelImportance.LOW,
         priority: NotificationPriority.LOW,
       ),
-      iosNotificationOptions: const IOSNotificationOptions(
-        showNotification: true,
-        playSound: false,
-      ),
+      iosNotificationOptions: const IOSNotificationOptions(showNotification: false, playSound: false),
       foregroundTaskOptions: ForegroundTaskOptions(
         eventAction: ForegroundTaskEventAction.repeat(_intervalSeconds * 1000),
         autoRunOnBoot: false,
@@ -139,16 +146,23 @@ class _TraceCollectorPageState extends State<TraceCollectorPage> {
 
   void _onDataFromTask(Object data) {
     if (data is Map<String, dynamic>) {
-      _privacyProcessor ??= createPrivacyProcessor(
-        config: PrivacyConfig(gridSeed: 'trace-collector'),
-      );
-      final lat = (data['lat'] as num).toDouble();
-      final lon = (data['lon'] as num).toDouble();
-      _lastPrivacyState = _privacyProcessor!.process(lat, lon);
-
-      setState(() => _trace.add(data));
-      _saveTrace();
+      _addPoint(data);
     }
+  }
+
+  // =====================
+  // Data handling
+  // =====================
+
+  void _addPoint(Map<String, dynamic> point) {
+    _privacyProcessor ??= createPrivacyProcessor(
+      config: PrivacyConfig(gridSeed: 'trace-collector'),
+    );
+    final lat = (point['lat'] as num).toDouble();
+    final lon = (point['lon'] as num).toDouble();
+    _lastPrivacyState = _privacyProcessor!.process(lat, lon);
+    setState(() => _trace.add(point));
+    _saveTrace();
   }
 
   Future<void> _loadTrace() async {
@@ -166,10 +180,13 @@ class _TraceCollectorPageState extends State<TraceCollectorPage> {
     await prefs.setString(_storageKey, jsonEncode(_trace));
   }
 
+  // =====================
+  // Start / Stop
+  // =====================
+
   Future<void> _start() async {
     if (_isCollecting) return;
 
-    // Location permission
     if (!await Geolocator.isLocationServiceEnabled()) {
       _showSnackBar('Location services disabled. Enable GPS.');
       return;
@@ -189,16 +206,21 @@ class _TraceCollectorPageState extends State<TraceCollectorPage> {
       return;
     }
 
-    // Notification permission (Android 13+)
+    if (_isAndroid) {
+      await _startAndroid();
+    } else {
+      await _startIos();
+    }
+  }
+
+  Future<void> _startAndroid() async {
     final notifPerm = await FlutterForegroundTask.checkNotificationPermission();
     if (notifPerm != NotificationPermission.granted) {
       await FlutterForegroundTask.requestNotificationPermission();
     }
 
-    // Re-init with selected interval
-    _initForegroundTask();
+    _initAndroidForegroundTask();
 
-    // Start service
     final result = await FlutterForegroundTask.startService(
       serviceId: 256,
       notificationTitle: 'Zairn Trace',
@@ -208,22 +230,73 @@ class _TraceCollectorPageState extends State<TraceCollectorPage> {
 
     if (result is ServiceRequestSuccess) {
       setState(() => _isCollecting = true);
-      _showSnackBar('Recording (background service, every ${_intervalSeconds}s)');
+      _showSnackBar('Recording (background service)');
     } else {
-      _showSnackBar('Failed to start service: $result');
+      _showSnackBar('Failed to start service');
     }
   }
 
+  Future<void> _startIos() async {
+    // iOS: use Geolocator stream with background mode enabled via Info.plist
+    _iosPosStream = Geolocator.getPositionStream(
+      locationSettings: AppleSettings(
+        accuracy: LocationAccuracy.high,
+        distanceFilter: 0,
+        activityType: ActivityType.other,
+        pauseLocationUpdatesAutomatically: false,
+        showBackgroundLocationIndicator: true,
+        allowBackgroundLocationUpdates: true,
+      ),
+    ).listen((pos) => _iosLastPos = pos);
+
+    // Record at fixed interval
+    _recordIosPoint();
+    _iosTimer = Timer.periodic(Duration(seconds: _intervalSeconds), (_) => _recordIosPoint());
+
+    setState(() => _isCollecting = true);
+    _showSnackBar('Recording (iOS background, every ${_intervalSeconds}s)');
+  }
+
+  void _recordIosPoint() {
+    final pos = _iosLastPos;
+    if (pos == null) return;
+    final now = DateTime.now();
+    _addPoint({
+      'lat': double.parse(pos.latitude.toStringAsFixed(7)),
+      'lon': double.parse(pos.longitude.toStringAsFixed(7)),
+      'accuracy': pos.accuracy.round(),
+      'speed': pos.speed,
+      'altitude': pos.altitude,
+      'timestamp': now.toIso8601String(),
+      'hour': now.hour,
+      'ts': now.millisecondsSinceEpoch,
+    });
+  }
+
   Future<void> _stop() async {
-    await FlutterForegroundTask.stopService();
+    if (_isAndroid) {
+      await FlutterForegroundTask.stopService();
+    } else {
+      _stopIos();
+    }
     setState(() => _isCollecting = false);
   }
 
+  void _stopIos() {
+    _iosPosStream?.cancel();
+    _iosPosStream = null;
+    _iosTimer?.cancel();
+    _iosTimer = null;
+  }
+
+  // =====================
+  // Export / Clear
+  // =====================
+
   Future<void> _export() async {
     if (_trace.isEmpty) { _showSnackBar('No data'); return; }
-
     final meta = {
-      'device': Platform.operatingSystem,
+      'device': '${Platform.operatingSystem} ${Platform.operatingSystemVersion}',
       'points': _trace.length,
       'startTime': _trace.first['timestamp'],
       'endTime': _trace.last['timestamp'],
@@ -234,11 +307,16 @@ class _TraceCollectorPageState extends State<TraceCollectorPage> {
     final filename = 'dense-trace-${DateFormat('yyyy-MM-dd').format(DateTime.now())}.json';
 
     try {
-      final dir = Directory('/storage/emulated/0/Download');
-      if (await dir.exists()) {
-        await File('${dir.path}/$filename').writeAsString(data);
-        _showSnackBar('Saved: Downloads/$filename (${(data.length / 1024).toStringAsFixed(0)} KB)');
+      if (Platform.isAndroid) {
+        final dir = Directory('/storage/emulated/0/Download');
+        if (await dir.exists()) {
+          await File('${dir.path}/$filename').writeAsString(data);
+          _showSnackBar('Saved: Downloads/$filename');
+          return;
+        }
       }
+      // Fallback: show size info
+      _showSnackBar('${_trace.length} points, ${(data.length / 1024).toStringAsFixed(0)} KB. Use share/airdrop to transfer.');
     } catch (e) {
       _showSnackBar('Export error: $e');
     }
@@ -267,7 +345,7 @@ class _TraceCollectorPageState extends State<TraceCollectorPage> {
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
   }
 
-  String _formatDuration() {
+  String _dur() {
     if (_trace.length < 2) return '0h';
     final ms = _trace.last['ts'] - _trace.first['ts'];
     return ms < 3600000 ? '${(ms / 60000).round()}m' : '${(ms / 3600000).toStringAsFixed(1)}h';
@@ -277,7 +355,7 @@ class _TraceCollectorPageState extends State<TraceCollectorPage> {
     null => '-',
     CoarseLocation(cellId: final id) => 'Coarse: $id',
     StateOnly(label: final l) => 'State: $l',
-    ProximityBucket(bucket: final b) => 'Proximity: $b',
+    ProximityBucket(bucket: final b) => 'Prox: $b',
     Suppressed(reason: final r) => 'Suppressed: $r',
     PreciseLocation() => 'Precise',
   };
@@ -301,9 +379,9 @@ class _TraceCollectorPageState extends State<TraceCollectorPage> {
                 Icon(_isCollecting ? Icons.my_location : Icons.location_off, size: 48,
                     color: _isCollecting ? t.colorScheme.primary : t.colorScheme.outline),
                 const SizedBox(height: 8),
-                Text(_isCollecting ? 'Recording (background)' : 'Stopped', style: t.textTheme.titleLarge),
+                Text(_isCollecting ? 'Recording${_isAndroid ? " (service)" : " (iOS bg)"}' : 'Stopped', style: t.textTheme.titleLarge),
                 const SizedBox(height: 4),
-                Text('${_trace.length} points | ${_formatDuration()}', style: t.textTheme.bodyMedium),
+                Text('${_trace.length} points | ${_dur()}', style: t.textTheme.bodyMedium),
               ]),
             ),
           ),
@@ -342,8 +420,7 @@ class _TraceCollectorPageState extends State<TraceCollectorPage> {
             child: _trace.isEmpty
                 ? Center(child: Text('Tap Start to begin.', style: t.textTheme.bodyLarge?.copyWith(color: t.colorScheme.outline)))
                 : ListView.builder(
-                    reverse: true,
-                    itemCount: _trace.length,
+                    reverse: true, itemCount: _trace.length,
                     itemBuilder: (_, i) {
                       final p = _trace[_trace.length - 1 - i];
                       return ListTile(
