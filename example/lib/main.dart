@@ -7,7 +7,6 @@ import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:intl/intl.dart';
 import 'package:path_provider/path_provider.dart';
-import 'package:share_plus/share_plus.dart';
 import 'package:zairn_sdk/zairn_sdk.dart';
 
 // ============================================================
@@ -248,14 +247,23 @@ class _TraceCollectorPageState extends State<TraceCollectorPage> with WidgetsBin
   // =====================
 
   Future<void> _export() async {
+    debugPrint('Export: starting...');
     if (_traceFile == null || !await _traceFile!.exists() || _pointCount == 0) {
-      _showSnackBar('No data');
+      _showSnackBar('No data to export');
       return;
     }
 
     try {
-      final lines = await _traceFile!.readAsLines();
-      final trace = lines.map((l) { try { return jsonDecode(l); } catch (_) { return null; } }).whereType<Map<String, dynamic>>().toList();
+      debugPrint('Export: reading ${_traceFile!.path}');
+      final raw = await _traceFile!.readAsString();
+      final lines = raw.split('\n').where((l) => l.trim().isNotEmpty).toList();
+      debugPrint('Export: ${lines.length} lines read');
+
+      final trace = <Map<String, dynamic>>[];
+      for (final l in lines) {
+        try { trace.add(jsonDecode(l) as Map<String, dynamic>); } catch (_) {}
+      }
+      debugPrint('Export: ${trace.length} valid points');
 
       final meta = {
         'device': '${Platform.operatingSystem} ${Platform.operatingSystemVersion}',
@@ -266,11 +274,13 @@ class _TraceCollectorPageState extends State<TraceCollectorPage> with WidgetsBin
       };
       final data = jsonEncode({'meta': meta, 'trace': trace});
       final filename = 'dense-trace-${DateFormat('yyyy-MM-dd-HHmm').format(DateTime.now())}.json';
+      debugPrint('Export: $filename (${(data.length / 1024).toStringAsFixed(0)} KB)');
 
-      // Save to temp directory (accessible by share sheet on all platforms)
-      final tmpDir = await getTemporaryDirectory();
-      final exportFile = File('${tmpDir.path}/$filename');
+      // Save to documents directory
+      final dir = await getApplicationDocumentsDirectory();
+      final exportFile = File('${dir.path}/$filename');
       await exportFile.writeAsString(data);
+      debugPrint('Export: saved to ${exportFile.path}');
 
       // Android: also save to Downloads
       if (Platform.isAndroid) {
@@ -278,16 +288,21 @@ class _TraceCollectorPageState extends State<TraceCollectorPage> with WidgetsBin
           final dlDir = Directory('/storage/emulated/0/Download');
           if (await dlDir.exists()) {
             await File('${dlDir.path}/$filename').writeAsString(data);
-            _showSnackBar('Also saved to Downloads/$filename');
+            debugPrint('Export: saved to Downloads/$filename');
           }
-        } catch (_) {}
+        } catch (e) {
+          debugPrint('Export: Downloads save failed: $e');
+        }
       }
 
-      // Open share sheet
-      await Share.shareXFiles(
-        [XFile(exportFile.path, mimeType: 'application/json')],
-      );
-    } catch (e) {
+      _showSnackBar('Saved: $filename (${trace.length} pts, ${(data.length / 1024).toStringAsFixed(0)} KB)');
+
+      // Show path for manual transfer
+      if (Platform.isIOS) {
+        _showSnackBar('iOS: use iTunes File Sharing or connect via Finder to access app documents');
+      }
+    } catch (e, stack) {
+      debugPrint('Export error: $e\n$stack');
       _showSnackBar('Export error: $e');
     }
   }
