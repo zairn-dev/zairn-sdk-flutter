@@ -12,6 +12,8 @@ import CoreLocation
   private var isCollecting = false
   private var intervalSeconds: Double = 60
   private var lastRecordedTime: Date = .distantPast
+  private var traceFileHandle: FileHandle?
+  private var pointCount: Int = 0
 
   override func application(
     _ application: UIApplication,
@@ -56,16 +58,33 @@ import CoreLocation
 
   private func startLocationUpdates() {
     locationManager.requestAlwaysAuthorization()
+
+    // Open trace file for direct writing
+    let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+    let filePath = docs.appendingPathComponent("dense-trace.jsonl")
+    if !FileManager.default.fileExists(atPath: filePath.path) {
+      FileManager.default.createFile(atPath: filePath.path, contents: nil)
+    }
+    traceFileHandle = try? FileHandle(forWritingTo: filePath)
+    traceFileHandle?.seekToEndOfFile()
+
+    // Count existing lines
+    if let content = try? String(contentsOf: filePath, encoding: .utf8) {
+      pointCount = content.components(separatedBy: "\n").filter { !$0.isEmpty }.count
+    }
+
     locationManager.startUpdatingLocation()
     isCollecting = true
     lastRecordedTime = .distantPast
-    NSLog("[ZairnLocation] Started native location updates")
+    NSLog("[ZairnLocation] Started. Existing points: %d", pointCount)
   }
 
   private func stopLocationUpdates() {
     locationManager.stopUpdatingLocation()
+    traceFileHandle?.closeFile()
+    traceFileHandle = nil
     isCollecting = false
-    NSLog("[ZairnLocation] Stopped")
+    NSLog("[ZairnLocation] Stopped. Total points: %d", pointCount)
   }
 
   // CLLocationManagerDelegate — called by iOS even in background
@@ -87,12 +106,21 @@ import CoreLocation
       "timestamp": now.timeIntervalSince1970 * 1000,
     ]
 
-    // Send to Dart via event channel
-    DispatchQueue.main.async { [weak self] in
-      self?.eventSink?(data)
+    // Write directly to file (survives Flutter engine death)
+    if let jsonData = try? JSONSerialization.data(withJSONObject: data),
+       let jsonString = String(data: jsonData, encoding: .utf8) {
+      traceFileHandle?.write((jsonString + "\n").data(using: .utf8)!)
+      traceFileHandle?.synchronizeFile()
+      pointCount += 1
     }
 
-    NSLog("[ZairnLocation] %.6f, %.6f (±%.0fm)", location.coordinate.latitude, location.coordinate.longitude, location.horizontalAccuracy)
+    // Also send to Dart UI if available (best-effort)
+    DispatchQueue.main.async { [weak self] in
+      guard let sink = self?.eventSink else { return }
+      sink(data)
+    }
+
+    NSLog("[ZairnLocation] #%d %.6f, %.6f (±%.0fm)", pointCount, location.coordinate.latitude, location.coordinate.longitude, location.horizontalAccuracy)
   }
 
   func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {

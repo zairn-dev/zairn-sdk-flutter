@@ -379,7 +379,7 @@ class _TraceCollectorPageState extends State<TraceCollectorPage> with WidgetsBin
     return Scaffold(
       appBar: AppBar(
         title: const Text('Zairn Trace Collector'),
-        actions: [IconButton(icon: const Icon(Icons.delete_outline), onPressed: _pointCount == 0 ? null : _clear)],
+        actions: [IconButton(icon: const Icon(Icons.delete_outline), onPressed: _clear)],
       ),
       body: Padding(
         padding: const EdgeInsets.all(16),
