@@ -45,5 +45,16 @@
 	<true/>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>Zairn needs your location to record GPS traces for research evaluation.</string>
+	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+	<string>Zairn needs background location access to continuously record GPS traces even when the app is not in the foreground.</string>
+	<key>NSLocationAlwaysUsageDescription</key>
+	<string>Zairn needs background location access to continuously record GPS traces.</string>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>location</string>
+		<string>fetch</string>
+	</array>
 </dict>
 </plist>
