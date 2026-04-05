@@ -127,29 +127,8 @@ import CoreLocation
     }
   }
 
-  // =====================
-  // App lifecycle
-  // =====================
-
-  override func applicationDidEnterBackground(_ application: UIApplication) {
-    if isCollecting {
-      beginBackgroundTaskIfNeeded()
-      // Restart location updates to ensure iOS keeps them running
-      locationManager.stopUpdatingLocation()
-      locationManager.startUpdatingLocation()
-      NSLog("[ZairnLocation] Entered background, restarted updates")
-    }
-  }
-
-  override func applicationWillEnterForeground(_ application: UIApplication) {
-    endBackgroundTask()
-    if isCollecting {
-      // Restart for fresh foreground updates
-      locationManager.stopUpdatingLocation()
-      locationManager.startUpdatingLocation()
-      NSLog("[ZairnLocation] Entered foreground, restarted updates. Points: %d", pointCount)
-    }
-  }
+  // No lifecycle restarts — CLLocationManager runs continuously
+  // Restarting on transitions causes Flutter engine crashes
 
   // =====================
   // CLLocationManagerDelegate

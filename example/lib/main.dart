@@ -96,12 +96,31 @@ class _TraceCollectorPageState extends State<TraceCollectorPage> with WidgetsBin
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
-      // Delay UI refresh to let iOS finish any pending work
-      Future.delayed(const Duration(milliseconds: 500), () {
+      // Reload point count from file after a safe delay
+      Future.delayed(const Duration(seconds: 1), () {
         if (mounted) {
-          _initTraceFile(); // Reload point count from file
+          _reloadPointCount();
         }
       });
+    }
+  }
+
+  Future<void> _reloadPointCount() async {
+    try {
+      if (_traceFile == null || !await _traceFile!.exists()) return;
+      final bytes = await _traceFile!.length();
+      if (bytes == 0) return;
+      // Count lines without loading entire file
+      final stream = _traceFile!.openRead();
+      int count = 0;
+      await for (final chunk in stream.transform(utf8.decoder).transform(const LineSplitter())) {
+        if (chunk.trim().isNotEmpty) count++;
+      }
+      if (mounted) {
+        setState(() => _pointCount = count);
+      }
+    } catch (e) {
+      debugPrint('Reload error: $e');
     }
   }
 
