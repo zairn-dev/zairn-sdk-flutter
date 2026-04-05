@@ -16,6 +16,10 @@ import CoreLocation
   private var pointCount: Int = 0
   private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
 
+  // UserDefaults key for persisting collection state across kills
+  private let kCollectingKey = "zairn_is_collecting"
+  private let kIntervalKey = "zairn_interval_seconds"
+
   override func application(
     _ application: UIApplication,
     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
@@ -49,18 +53,24 @@ import CoreLocation
     eventChannel = FlutterEventChannel(name: "zairn/ios_location_events", binaryMessenger: controller.binaryMessenger)
     eventChannel?.setStreamHandler(self)
 
-    // Location manager setup
+    // Location manager setup (always, even before start)
     locationManager.delegate = self
     locationManager.desiredAccuracy = kCLLocationAccuracyBest
     locationManager.allowsBackgroundLocationUpdates = true
     locationManager.pausesLocationUpdatesAutomatically = false
     locationManager.showsBackgroundLocationIndicator = true
-    // Small nonzero filter: iOS keeps sending updates even when nearly stationary
     locationManager.distanceFilter = 1.0
 
-    // If app was launched by significant location change, resume collecting
-    if launchOptions?[.location] != nil {
-      NSLog("[ZairnLocation] App launched by location event, resuming collection")
+    // Auto-resume after iOS kill:
+    // If app was launched by location event OR was previously collecting
+    let wasCollecting = UserDefaults.standard.bool(forKey: kCollectingKey)
+    let launchedByLocation = launchOptions?[.location] != nil
+
+    if wasCollecting || launchedByLocation {
+      intervalSeconds = UserDefaults.standard.double(forKey: kIntervalKey)
+      if intervalSeconds < 10 { intervalSeconds = 60 }
+      NSLog("[ZairnLocation] Auto-resuming: wasCollecting=%d launchedByLocation=%d interval=%.0f",
+            wasCollecting, launchedByLocation, intervalSeconds)
       startLocationUpdates()
     }
 
@@ -87,14 +97,16 @@ import CoreLocation
       pointCount = content.components(separatedBy: "\n").filter { !$0.isEmpty }.count
     }
 
-    // Start BOTH location services:
-    // 1. Continuous updates (main GPS, may be throttled in background)
+    // Start both services
     locationManager.startUpdatingLocation()
-    // 2. Significant location change (wake-up mechanism, survives app kill)
     locationManager.startMonitoringSignificantLocationChanges()
 
     isCollecting = true
     lastRecordedTime = .distantPast
+
+    // Persist state so we can resume after kill
+    UserDefaults.standard.set(true, forKey: kCollectingKey)
+    UserDefaults.standard.set(intervalSeconds, forKey: kIntervalKey)
 
     NSLog("[ZairnLocation] Started. Points: %d, interval: %.0fs", pointCount, intervalSeconds)
   }
@@ -106,11 +118,15 @@ import CoreLocation
     traceFileHandle?.closeFile()
     traceFileHandle = nil
     isCollecting = false
+
+    // Clear persisted state
+    UserDefaults.standard.set(false, forKey: kCollectingKey)
+
     NSLog("[ZairnLocation] Stopped. Total: %d", pointCount)
   }
 
   // =====================
-  // Background task management
+  // Background task
   // =====================
 
   private func beginBackgroundTaskIfNeeded() {
@@ -128,7 +144,6 @@ import CoreLocation
   }
 
   // No lifecycle restarts — CLLocationManager runs continuously
-  // Restarting on transitions causes Flutter engine crashes
 
   // =====================
   // CLLocationManagerDelegate
@@ -136,17 +151,13 @@ import CoreLocation
 
   func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
     guard isCollecting, let location = locations.last else { return }
-    // Reject stale or inaccurate locations
     guard location.horizontalAccuracy >= 0 && location.horizontalAccuracy < 100 else { return }
-    let age = -location.timestamp.timeIntervalSinceNow
-    guard age < 30 else { return } // Skip locations older than 30s
+    guard -location.timestamp.timeIntervalSinceNow < 30 else { return }
 
-    // Throttle by interval
     let now = Date()
     if now.timeIntervalSince(lastRecordedTime) < intervalSeconds { return }
     lastRecordedTime = now
 
-    // Extend background execution time
     beginBackgroundTaskIfNeeded()
 
     let data: [String: Any] = [
@@ -159,7 +170,7 @@ import CoreLocation
       "timestamp": now.timeIntervalSince1970 * 1000,
     ]
 
-    // Write to file (always, regardless of app state)
+    // Write to file (always)
     if let jsonData = try? JSONSerialization.data(withJSONObject: data),
        let jsonString = String(data: jsonData, encoding: .utf8) {
       traceFileHandle?.write((jsonString + "\n").data(using: .utf8)!)
@@ -181,13 +192,11 @@ import CoreLocation
           location.horizontalAccuracy,
           UIApplication.shared.applicationState != .active ? "YES" : "NO")
 
-    // End background task after write, then start new one for next update
     endBackgroundTask()
   }
 
   func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
     NSLog("[ZairnLocation] Error: %@", error.localizedDescription)
-    // On error, try restarting
     if isCollecting {
       locationManager.stopUpdatingLocation()
       DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
@@ -196,12 +205,9 @@ import CoreLocation
     }
   }
 
-  // Significant location change (wake-up from kill)
-  func locationManager(_ manager: CLLocationManager, didFinishDeferredUpdatesWithError error: Error?) {
-    if let error = error {
-      NSLog("[ZairnLocation] Deferred error: %@", error.localizedDescription)
-    }
-  }
+  // Called when app is terminated but significant location change fires
+  // iOS relaunches the app, and didFinishLaunchingWithOptions has .location key
+  // → auto-resume handled there
 }
 
 // FlutterStreamHandler
