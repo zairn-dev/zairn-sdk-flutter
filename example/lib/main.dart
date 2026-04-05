@@ -287,52 +287,86 @@ class _TraceCollectorPageState extends State<TraceCollectorPage> with WidgetsBin
     }
 
     try {
-      debugPrint('Export: reading ${_traceFile!.path}');
-      final raw = await _traceFile!.readAsString();
-      final lines = raw.split('\n').where((l) => l.trim().isNotEmpty).toList();
-      debugPrint('Export: ${lines.length} lines read');
-
-      final trace = <Map<String, dynamic>>[];
-      for (final l in lines) {
-        try { trace.add(jsonDecode(l) as Map<String, dynamic>); } catch (_) {}
-      }
-      debugPrint('Export: ${trace.length} valid points');
-
-      final meta = {
-        'device': '${Platform.operatingSystem} ${Platform.operatingSystemVersion}',
-        'points': trace.length,
-        'startTime': trace.isNotEmpty ? trace.first['timestamp'] : null,
-        'endTime': trace.isNotEmpty ? trace.last['timestamp'] : null,
-        'intervalSeconds': _intervalSeconds,
-      };
-      final data = jsonEncode({'meta': meta, 'trace': trace});
       final filename = 'dense-trace-${DateFormat('yyyy-MM-dd-HHmm').format(DateTime.now())}.json';
-      debugPrint('Export: $filename (${(data.length / 1024).toStringAsFixed(0)} KB)');
-
-      // Save to documents directory
       final dir = await getApplicationDocumentsDirectory();
       final exportFile = File('${dir.path}/$filename');
-      await exportFile.writeAsString(data);
-      debugPrint('Export: saved to ${exportFile.path}');
 
-      // Android: also save to Downloads
+      // Stream-write: never load entire trace into memory
+      final sink = exportFile.openWrite();
+      final source = _traceFile!.openRead();
+      final lines = source.transform(utf8.decoder).transform(const LineSplitter());
+
+      String? firstTs;
+      String? lastTs;
+      int count = 0;
+
+      // Write opening
+      sink.write('{"meta":');
+
+      // Buffer trace entries, write in chunks
+      final traceBuffer = StringBuffer();
+      traceBuffer.write('[');
+      bool first = true;
+
+      await for (final line in lines) {
+        if (line.trim().isEmpty) continue;
+        try {
+          // Validate it's valid JSON
+          final parsed = jsonDecode(line);
+          if (!first) traceBuffer.write(',');
+          traceBuffer.write(line);
+          first = false;
+          count++;
+
+          // Track first/last timestamp
+          final ts = parsed['timestamp']?.toString();
+          firstTs ??= ts;
+          lastTs = ts;
+
+          // Flush buffer every 500 entries to limit memory
+          if (count % 500 == 0) {
+            sink.write(traceBuffer.toString());
+            traceBuffer.clear();
+            debugPrint('Export: $count points written...');
+          }
+        } catch (_) {}
+      }
+
+      traceBuffer.write(']');
+
+      // Write meta + remaining trace
+      final meta = jsonEncode({
+        'device': '${Platform.operatingSystem} ${Platform.operatingSystemVersion}',
+        'points': count,
+        'startTime': firstTs,
+        'endTime': lastTs,
+        'intervalSeconds': _intervalSeconds,
+      });
+      sink.write(meta);
+      sink.write(',"trace":');
+      sink.write(traceBuffer.toString());
+      sink.write('}');
+      await sink.flush();
+      await sink.close();
+
+      final size = await exportFile.length();
+      debugPrint('Export: $filename ($count pts, ${(size / 1024).toStringAsFixed(0)} KB)');
+
+      // Android: also copy to Downloads
       if (Platform.isAndroid) {
         try {
           final dlDir = Directory('/storage/emulated/0/Download');
           if (await dlDir.exists()) {
-            await File('${dlDir.path}/$filename').writeAsString(data);
-            debugPrint('Export: saved to Downloads/$filename');
+            await exportFile.copy('${dlDir.path}/$filename');
           }
         } catch (e) {
-          debugPrint('Export: Downloads save failed: $e');
+          debugPrint('Export: Downloads copy failed: $e');
         }
       }
 
-      _showSnackBar('Saved: $filename (${trace.length} pts, ${(data.length / 1024).toStringAsFixed(0)} KB)');
-
-      // Show path for manual transfer
+      _showSnackBar('Saved: $filename ($count pts, ${(size / 1024).toStringAsFixed(0)} KB)');
       if (Platform.isIOS) {
-        _showSnackBar('iOS: use iTunes File Sharing or connect via Finder to access app documents');
+        _showSnackBar('Connect iPhone to Finder to access files');
       }
     } catch (e, stack) {
       debugPrint('Export error: $e\n$stack');
