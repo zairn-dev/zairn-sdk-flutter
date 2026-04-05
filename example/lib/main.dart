@@ -74,6 +74,7 @@ class _TraceCollectorPageState extends State<TraceCollectorPage> with WidgetsBin
 
   PrivacyProcessor? _privacyProcessor;
   LocationState? _lastPrivacyState;
+  bool _lowPowerMode = false;
 
   // File-based storage (not SharedPreferences — avoids OOM)
   File? _traceFile;
@@ -186,6 +187,17 @@ class _TraceCollectorPageState extends State<TraceCollectorPage> with WidgetsBin
         // iOS: native CLLocationManager (no Flutter Timer, no stream)
         _iosEventSub = _iosEvents.receiveBroadcastStream().listen((data) {
           if (data is Map) {
+            // Check for low power mode notification
+            if (data.containsKey('_lowPowerMode')) {
+              final lp = data['_lowPowerMode'] == true;
+              if (mounted) setState(() => _lowPowerMode = lp);
+              if (lp) {
+                _showSnackBar('Low Power Mode ON — GPS accuracy reduced. Disable for best results.');
+              } else {
+                _showSnackBar('Low Power Mode OFF — full GPS resumed.');
+              }
+              return;
+            }
             try {
               final pos = Position(
                 latitude: (data['latitude'] as num).toDouble(),
@@ -399,7 +411,7 @@ class _TraceCollectorPageState extends State<TraceCollectorPage> with WidgetsBin
                 Icon(_isCollecting ? Icons.my_location : Icons.location_off, size: 48,
                     color: _isCollecting ? t.colorScheme.primary : t.colorScheme.outline),
                 const SizedBox(height: 8),
-                Text(_isCollecting ? 'Recording' : 'Stopped', style: t.textTheme.titleLarge),
+                Text(_isCollecting ? (_lowPowerMode ? 'Recording (low power)' : 'Recording') : 'Stopped', style: t.textTheme.titleLarge),
                 const SizedBox(height: 4),
                 Text('$_pointCount points', style: t.textTheme.bodyMedium),
               ]),

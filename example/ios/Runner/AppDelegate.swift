@@ -61,8 +61,15 @@ import CoreLocation
     locationManager.showsBackgroundLocationIndicator = true
     locationManager.distanceFilter = 1.0
 
+    // Monitor low power mode changes
+    NotificationCenter.default.addObserver(
+      self,
+      selector: #selector(powerStateChanged),
+      name: NSNotification.Name.NSProcessInfoPowerStateDidChange,
+      object: nil
+    )
+
     // Auto-resume after iOS kill:
-    // If app was launched by location event OR was previously collecting
     let wasCollecting = UserDefaults.standard.bool(forKey: kCollectingKey)
     let launchedByLocation = launchOptions?[.location] != nil
 
@@ -143,7 +150,34 @@ import CoreLocation
     }
   }
 
-  // No lifecycle restarts — CLLocationManager runs continuously
+  // =====================
+  // Low Power Mode handling
+  // =====================
+
+  @objc private func powerStateChanged() {
+    let isLowPower = ProcessInfo.processInfo.isLowPowerModeEnabled
+    NSLog("[ZairnLocation] Low Power Mode: %@", isLowPower ? "ON" : "OFF")
+
+    if isCollecting {
+      if isLowPower {
+        // Switch to significant-change only (survives low power)
+        locationManager.stopUpdatingLocation()
+        // Keep significant location change running
+        NSLog("[ZairnLocation] Switched to significant-change only (low power)")
+      } else {
+        // Resume full GPS updates
+        locationManager.startUpdatingLocation()
+        NSLog("[ZairnLocation] Resumed full GPS updates")
+      }
+    }
+
+    // Notify Dart UI
+    if UIApplication.shared.applicationState == .active {
+      DispatchQueue.main.async { [weak self] in
+        self?.eventSink?(["_lowPowerMode": isLowPower])
+      }
+    }
+  }
 
   // =====================
   // CLLocationManagerDelegate
