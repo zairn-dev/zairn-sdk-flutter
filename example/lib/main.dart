@@ -306,86 +306,30 @@ class _TraceCollectorPageState extends State<TraceCollectorPage> with WidgetsBin
     }
 
     try {
-      final filename = 'dense-trace-${DateFormat('yyyy-MM-dd-HHmm').format(DateTime.now())}.json';
+      // Simple: just copy the JSONL file as-is. No parsing, no memory pressure.
+      final filename = 'dense-trace-${DateFormat('yyyy-MM-dd-HHmm').format(DateTime.now())}.jsonl';
       final dir = await getApplicationDocumentsDirectory();
       final exportFile = File('${dir.path}/$filename');
 
-      // Stream-write: never load entire trace into memory
-      final sink = exportFile.openWrite();
-      final source = _traceFile!.openRead();
-      final lines = source.transform(utf8.decoder).transform(const LineSplitter());
-
-      String? firstTs;
-      String? lastTs;
-      int count = 0;
-
-      // Write opening
-      sink.write('{"meta":');
-
-      // Buffer trace entries, write in chunks
-      final traceBuffer = StringBuffer();
-      traceBuffer.write('[');
-      bool first = true;
-
-      await for (final line in lines) {
-        if (line.trim().isEmpty) continue;
-        try {
-          // Validate it's valid JSON
-          final parsed = jsonDecode(line);
-          if (!first) traceBuffer.write(',');
-          traceBuffer.write(line);
-          first = false;
-          count++;
-
-          // Track first/last timestamp
-          final ts = parsed['timestamp']?.toString();
-          firstTs ??= ts;
-          lastTs = ts;
-
-          // Flush buffer every 500 entries to limit memory
-          if (count % 500 == 0) {
-            sink.write(traceBuffer.toString());
-            traceBuffer.clear();
-            debugPrint('Export: $count points written...');
-          }
-        } catch (_) {}
-      }
-
-      traceBuffer.write(']');
-
-      // Write meta + remaining trace
-      final meta = jsonEncode({
-        'device': '${Platform.operatingSystem} ${Platform.operatingSystemVersion}',
-        'points': count,
-        'startTime': firstTs,
-        'endTime': lastTs,
-        'intervalSeconds': _intervalSeconds,
-      });
-      sink.write(meta);
-      sink.write(',"trace":');
-      sink.write(traceBuffer.toString());
-      sink.write('}');
-      await sink.flush();
-      await sink.close();
-
+      await _traceFile!.copy(exportFile.path);
       final size = await exportFile.length();
-      debugPrint('Export: $filename ($count pts, ${(size / 1024).toStringAsFixed(0)} KB)');
+      debugPrint('Export: copied ${exportFile.path} (${(size / 1024).toStringAsFixed(0)} KB)');
 
       // Android: also copy to Downloads
       if (Platform.isAndroid) {
         try {
           final dlDir = Directory('/storage/emulated/0/Download');
           if (await dlDir.exists()) {
-            await exportFile.copy('${dlDir.path}/$filename');
+            await _traceFile!.copy('${dlDir.path}/$filename');
           }
         } catch (e) {
           debugPrint('Export: Downloads copy failed: $e');
         }
       }
 
-      _showSnackBar('Saved: $filename ($count pts, ${(size / 1024).toStringAsFixed(0)} KB)');
+      _showSnackBar('Saved: $filename ($_pointCount pts, ${(size / 1024).toStringAsFixed(0)} KB)');
       if (Platform.isIOS) {
-        _showSnackBar('Connect iPhone to Finder to access files');
+        _showSnackBar('Use Finder to access app files');
       }
     } catch (e, stack) {
       debugPrint('Export error: $e\n$stack');
