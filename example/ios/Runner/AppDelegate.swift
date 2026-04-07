@@ -76,15 +76,8 @@ import CoreLocation
     if wasCollecting || launchedByLocation {
       intervalSeconds = UserDefaults.standard.double(forKey: kIntervalKey)
       if intervalSeconds < 10 { intervalSeconds = 60 }
-      // Delay auto-resume to avoid crash loop on startup
-      NSLog("[ZairnLocation] Will auto-resume in 3s: wasCollecting=%d launchedByLocation=%d", wasCollecting, launchedByLocation)
-      DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
-        guard let self = self else { return }
-        // Check again — user may have opened app and tapped Stop
-        if UserDefaults.standard.bool(forKey: self.kCollectingKey) {
-          self.startLocationUpdates()
-        }
-      }
+      NSLog("[ZairnLocation] Auto-resuming: wasCollecting=%d launchedByLocation=%d", wasCollecting, launchedByLocation)
+      startLocationUpdates()
     }
 
     return super.application(application, didFinishLaunchingWithOptions: launchOptions)
@@ -98,10 +91,7 @@ import CoreLocation
     let wasCollecting = UserDefaults.standard.bool(forKey: kCollectingKey)
     if wasCollecting && !isCollecting {
       NSLog("[ZairnLocation] Background fetch: restarting location")
-      // Delay slightly to avoid race with app startup
-      DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
-        self?.startLocationUpdates()
-      }
+      startLocationUpdates()
       completionHandler(.newData)
     } else {
       completionHandler(.noData)
@@ -113,44 +103,36 @@ import CoreLocation
   // =====================
 
   private func startLocationUpdates() {
-    // Wrap everything in do-catch to prevent crash loops
-    do {
-      locationManager.requestAlwaysAuthorization()
+    locationManager.requestAlwaysAuthorization()
 
-      // Open trace file (safe: if file is corrupted, create new)
-      let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-      let filePath = docs.appendingPathComponent("dense-trace.jsonl")
-      if !FileManager.default.fileExists(atPath: filePath.path) {
-        FileManager.default.createFile(atPath: filePath.path, contents: nil)
-      }
-      traceFileHandle = try? FileHandle(forWritingTo: filePath)
-      traceFileHandle?.seekToEndOfFile()
-
-      // Count existing points (safe: don't load entire file if huge)
-      if let attrs = try? FileManager.default.attributesOfItem(atPath: filePath.path),
-         let size = attrs[.size] as? UInt64, size < 50_000_000 { // <50MB: count lines
-        if let content = try? String(contentsOf: filePath, encoding: .utf8) {
-          pointCount = content.components(separatedBy: "\n").filter { !$0.isEmpty }.count
-        }
-      } else {
-        pointCount = -1 // Too large to count, just append
-      }
-
-      locationManager.startUpdatingLocation()
-      locationManager.startMonitoringSignificantLocationChanges()
-      locationManager.startMonitoringVisits()
-
-      isCollecting = true
-      lastRecordedTime = .distantPast
-
-      UserDefaults.standard.set(true, forKey: kCollectingKey)
-      UserDefaults.standard.set(intervalSeconds, forKey: kIntervalKey)
-
-      NSLog("[ZairnLocation] Started. Points: %d, interval: %.0fs", pointCount, intervalSeconds)
-    } catch {
-      NSLog("[ZairnLocation] FAILED to start: %@", error.localizedDescription)
-      // Don't set isCollecting = true, so user can try again
+    // Open trace file
+    let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+    let filePath = docs.appendingPathComponent("dense-trace.jsonl")
+    if !FileManager.default.fileExists(atPath: filePath.path) {
+      FileManager.default.createFile(atPath: filePath.path, contents: nil)
     }
+    traceFileHandle = try? FileHandle(forWritingTo: filePath)
+    traceFileHandle?.seekToEndOfFile()
+
+    if let content = try? String(contentsOf: filePath, encoding: .utf8) {
+      pointCount = content.components(separatedBy: "\n").filter { !$0.isEmpty }.count
+    }
+
+    // Start ALL location services for maximum wake-up coverage:
+    // 1. Continuous GPS updates (primary, may be throttled in background)
+    locationManager.startUpdatingLocation()
+    // 2. Significant location changes (survives app kill, ~500m threshold)
+    locationManager.startMonitoringSignificantLocationChanges()
+    // 3. Visit monitoring (fires on arrival/departure detection)
+    locationManager.startMonitoringVisits()
+
+    isCollecting = true
+    lastRecordedTime = .distantPast
+
+    UserDefaults.standard.set(true, forKey: kCollectingKey)
+    UserDefaults.standard.set(intervalSeconds, forKey: kIntervalKey)
+
+    NSLog("[ZairnLocation] Started. Points: %d, interval: %.0fs", pointCount, intervalSeconds)
   }
 
   private func stopLocationUpdates() {
