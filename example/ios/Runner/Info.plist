@@ -51,6 +51,10 @@
 	<string>Zairn needs background location access to continuously record GPS traces even when the app is not in the foreground.</string>
 	<key>NSLocationAlwaysUsageDescription</key>
 	<string>Zairn needs background location access to continuously record GPS traces.</string>
+	<key>BGTaskSchedulerPermittedIdentifiers</key>
+	<array>
+		<string>com.pravera.flutter_foreground_task.refresh</string>
+	</array>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>location</string>

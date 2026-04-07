@@ -12,23 +12,226 @@ import CoreLocation
   private var isCollecting = false
   private var intervalSeconds: Double = 60
   private var lastRecordedTime: Date = .distantPast
-  private var traceFileHandle: FileHandle?
   private var pointCount: Int = 0
-  private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
   private var lastKnownLocation: CLLocation?
+  private var flutterChannelsConfigured = false
+  private var isRestarting = false
+  private var gpsErrorCount = 0
+  private var bgActivitySession: NSObject? // CLBackgroundActivitySession (iOS 17+)
 
   private let kCollectingKey = "zairn_is_collecting"
   private let kIntervalKey = "zairn_interval_seconds"
   private let kRegionId = "zairn_rolling_geofence"
   private let kCrashCountKey = "zairn_crash_count"
 
+  // Cached paths (avoid repeated FileManager lookups)
+  private lazy var docsDir: URL = {
+    FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+  }()
+  private lazy var traceFilePath: URL = { docsDir.appendingPathComponent("dense-trace.jsonl") }()
+  private lazy var crashLogFilePath: URL = { docsDir.appendingPathComponent("zairn-crash-log.txt") }()
+
+  // Cached formatter
+  private static let isoFormatter: ISO8601DateFormatter = {
+    let f = ISO8601DateFormatter()
+    return f
+  }()
+
+  // =====================
+  // App Launch
+  // =====================
+
   override func application(
     _ application: UIApplication,
     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
   ) -> Bool {
-    GeneratedPluginRegistrant.register(with: self)
+    // === FIRST: crash loop detection (before ANY plugin code) ===
+    let crashCount = UserDefaults.standard.integer(forKey: kCrashCountKey)
+    if crashCount >= 3 {
+      NSLog("[ZairnLocation] CRASH LOOP DETECTED (%d). Disabling auto-resume.", crashCount)
+      UserDefaults.standard.set(false, forKey: kCollectingKey)
+      UserDefaults.standard.set(0, forKey: kCrashCountKey)
+    }
 
-    let controller = window?.rootViewController as! FlutterViewController
+    installCrashLogger()
+    logEvent("APP_LAUNCH crash_count=\(crashCount)")
+
+    // Plugin registration
+    GeneratedPluginRegistrant.register(with: self)
+    if let pluginClass = NSClassFromString("FlutterForegroundTaskPlugin") as? NSObjectProtocol {
+      let sel = NSSelectorFromString("setPluginRegistrantCallback:")
+      if pluginClass.responds(to: sel) {
+        FlutterForegroundTaskPlugin.setPluginRegistrantCallback { registry in
+          GeneratedPluginRegistrant.register(with: registry)
+        }
+      }
+    }
+
+    configureFlutterChannelsIfPossible()
+
+    // Location manager setup (lightweight)
+    locationManager.delegate = self
+    locationManager.desiredAccuracy = kCLLocationAccuracyBest
+    locationManager.allowsBackgroundLocationUpdates = true
+    locationManager.pausesLocationUpdatesAutomatically = false
+    locationManager.showsBackgroundLocationIndicator = true
+    locationManager.distanceFilter = 1.0
+
+    NotificationCenter.default.addObserver(
+      self, selector: #selector(powerStateChanged),
+      name: NSNotification.Name.NSProcessInfoPowerStateDidChange, object: nil
+    )
+
+    UIApplication.shared.setMinimumBackgroundFetchInterval(UIApplication.backgroundFetchIntervalMinimum)
+
+    // Auto-resume (crash counter is NOT incremented here — only on actual start)
+    let wasCollecting = UserDefaults.standard.bool(forKey: kCollectingKey)
+    let launchedByLocation = launchOptions?[.location] != nil
+
+    if (wasCollecting || launchedByLocation) && crashCount < 3 {
+      intervalSeconds = UserDefaults.standard.double(forKey: kIntervalKey)
+      if intervalSeconds < 10 { intervalSeconds = 60 }
+
+      logEvent("AUTO_RESUME scheduled (crash_count=\(crashCount))")
+
+      DispatchQueue.main.asyncAfter(deadline: .now() + 5.0) { [weak self] in
+        guard let self = self else { return }
+        guard UserDefaults.standard.bool(forKey: self.kCollectingKey) else { return }
+        // Increment crash counter only when we actually start
+        UserDefaults.standard.set(crashCount + 1, forKey: self.kCrashCountKey)
+        self.logEvent("AUTO_RESUME executing")
+        self.startLocationUpdates()
+      }
+    }
+
+    return super.application(application, didFinishLaunchingWithOptions: launchOptions)
+  }
+
+  // =====================
+  // Lifecycle
+  // =====================
+
+  override func applicationDidBecomeActive(_ application: UIApplication) {
+    super.applicationDidBecomeActive(application)
+    logEvent("APP_DID_BECOME_ACTIVE pts=\(pointCount)")
+    configureFlutterChannelsIfPossible()
+    // Restore high accuracy in foreground
+    if isCollecting {
+      locationManager.desiredAccuracy = kCLLocationAccuracyBest
+    }
+  }
+
+  override func applicationDidEnterBackground(_ application: UIApplication) {
+    super.applicationDidEnterBackground(application)
+    logEvent("APP_DID_ENTER_BACKGROUND pts=\(pointCount)")
+    // Reduce accuracy in background to lower power consumption
+    // This makes iOS less likely to kill us for energy
+    if isCollecting {
+      locationManager.desiredAccuracy = kCLLocationAccuracyNearestTenMeters
+    }
+  }
+
+  override func applicationWillTerminate(_ application: UIApplication) {
+    super.applicationWillTerminate(application)
+    logEvent("APP_WILL_TERMINATE pts=\(pointCount)")
+  }
+
+  override func applicationDidReceiveMemoryWarning(_ application: UIApplication) {
+    super.applicationDidReceiveMemoryWarning(application)
+    logEvent("MEMORY_WARNING pts=\(pointCount)")
+  }
+
+  // =====================
+  // Background Fetch
+  // =====================
+
+  override func application(_ application: UIApplication, performFetchWithCompletionHandler completionHandler: @escaping (UIBackgroundFetchResult) -> Void) {
+    guard UserDefaults.standard.bool(forKey: kCollectingKey), !isCollecting else {
+      completionHandler(.noData)
+      return
+    }
+    let cc = UserDefaults.standard.integer(forKey: kCrashCountKey)
+    guard cc < 3 else { completionHandler(.noData); return }
+
+    logEvent("BG_FETCH: restarting")
+    // Start location, THEN call completion handler
+    DispatchQueue.main.async { [weak self] in
+      self?.startLocationUpdates()
+      // Give iOS a moment to register the location service
+      DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+        completionHandler(.newData)
+      }
+    }
+  }
+
+  // =====================
+  // Start / Stop
+  // =====================
+
+  private func startLocationUpdates() {
+    let status = locationManager.authorizationStatus
+    if status == .notDetermined {
+      locationManager.requestAlwaysAuthorization()
+    }
+
+    ensureTraceFileExists()
+
+    // iOS 17+: CLBackgroundActivitySession tells iOS to prioritize this app
+    if #available(iOS 17.0, *) {
+      if bgActivitySession == nil {
+        bgActivitySession = CLBackgroundActivitySession() as NSObject
+        logEvent("CLBackgroundActivitySession started")
+      }
+    }
+
+    // Activity type hint: .other is most general
+    locationManager.activityType = .other
+
+    locationManager.startUpdatingLocation()
+    locationManager.startMonitoringSignificantLocationChanges()
+    locationManager.startMonitoringVisits()
+
+    isCollecting = true
+    isRestarting = false
+    gpsErrorCount = 0
+    lastRecordedTime = .distantPast
+
+    UserDefaults.standard.set(true, forKey: kCollectingKey)
+    UserDefaults.standard.set(intervalSeconds, forKey: kIntervalKey)
+
+    logEvent("STARTED interval=\(intervalSeconds)s")
+  }
+
+  private func stopLocationUpdates() {
+    locationManager.stopUpdatingLocation()
+    locationManager.stopMonitoringSignificantLocationChanges()
+    locationManager.stopMonitoringVisits()
+    removeRollingGeofence()
+    if #available(iOS 17.0, *) {
+      (bgActivitySession as? CLBackgroundActivitySession)?.invalidate()
+      bgActivitySession = nil
+    }
+    isCollecting = false
+    isRestarting = false
+    UserDefaults.standard.set(false, forKey: kCollectingKey)
+    UserDefaults.standard.set(0, forKey: kCrashCountKey)
+    logEvent("STOPPED pts=\(pointCount)")
+  }
+
+  private func ensureTraceFileExists() {
+    if !FileManager.default.fileExists(atPath: traceFilePath.path) {
+      FileManager.default.createFile(atPath: traceFilePath.path, contents: nil)
+    }
+    pointCount = 0
+  }
+
+  // =====================
+  // Flutter Channels (deferred setup)
+  // =====================
+
+  private func configureFlutterChannelsIfPossible() {
+    guard !flutterChannelsConfigured else { return }
+    guard let controller = window?.rootViewController as? FlutterViewController else { return }
 
     channel = FlutterMethodChannel(name: "zairn/ios_location", binaryMessenger: controller.binaryMessenger)
     channel?.setMethodCallHandler { [weak self] call, result in
@@ -36,7 +239,6 @@ import CoreLocation
       case "start":
         let args = call.arguments as? [String: Any]
         self?.intervalSeconds = args?["intervalSeconds"] as? Double ?? 60
-        // Reset crash counter on manual start
         UserDefaults.standard.set(0, forKey: self?.kCrashCountKey ?? "")
         self?.startLocationUpdates()
         result(true)
@@ -54,122 +256,7 @@ import CoreLocation
 
     eventChannel = FlutterEventChannel(name: "zairn/ios_location_events", binaryMessenger: controller.binaryMessenger)
     eventChannel?.setStreamHandler(self)
-
-    // Location manager setup
-    locationManager.delegate = self
-    locationManager.desiredAccuracy = kCLLocationAccuracyBest
-    locationManager.allowsBackgroundLocationUpdates = true
-    locationManager.pausesLocationUpdatesAutomatically = false
-    locationManager.showsBackgroundLocationIndicator = true
-    locationManager.distanceFilter = 1.0
-
-    // Low power mode
-    NotificationCenter.default.addObserver(
-      self, selector: #selector(powerStateChanged),
-      name: NSNotification.Name.NSProcessInfoPowerStateDidChange, object: nil
-    )
-
-    // Background fetch
-    UIApplication.shared.setMinimumBackgroundFetchInterval(UIApplication.backgroundFetchIntervalMinimum)
-
-    // --- Crash-safe auto-resume ---
-    let wasCollecting = UserDefaults.standard.bool(forKey: kCollectingKey)
-    let launchedByLocation = launchOptions?[.location] != nil
-    let crashCount = UserDefaults.standard.integer(forKey: kCrashCountKey)
-
-    if (wasCollecting || launchedByLocation) && crashCount < 3 {
-      // Increment crash counter BEFORE starting (decrement on successful write)
-      UserDefaults.standard.set(crashCount + 1, forKey: kCrashCountKey)
-
-      intervalSeconds = UserDefaults.standard.double(forKey: kIntervalKey)
-      if intervalSeconds < 10 { intervalSeconds = 60 }
-
-      NSLog("[ZairnLocation] Auto-resume in 3s (crash_count=%d)", crashCount + 1)
-
-      // Delay to let Flutter engine finish initializing
-      DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
-        guard let self = self else { return }
-        if UserDefaults.standard.bool(forKey: self.kCollectingKey) {
-          self.startLocationUpdates()
-        }
-      }
-    } else if crashCount >= 3 {
-      NSLog("[ZairnLocation] Auto-resume DISABLED: crash loop detected (%d crashes). Tap Start manually.", crashCount)
-      // Reset so user can manually start
-      UserDefaults.standard.set(false, forKey: kCollectingKey)
-      UserDefaults.standard.set(0, forKey: kCrashCountKey)
-    }
-
-    return super.application(application, didFinishLaunchingWithOptions: launchOptions)
-  }
-
-  // =====================
-  // Background Fetch
-  // =====================
-
-  override func application(_ application: UIApplication, performFetchWithCompletionHandler completionHandler: @escaping (UIBackgroundFetchResult) -> Void) {
-    if UserDefaults.standard.bool(forKey: kCollectingKey) && !isCollecting {
-      let crashCount = UserDefaults.standard.integer(forKey: kCrashCountKey)
-      guard crashCount < 3 else { completionHandler(.noData); return }
-      NSLog("[ZairnLocation] Background fetch: restarting")
-      DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
-        self?.startLocationUpdates()
-      }
-      completionHandler(.newData)
-    } else {
-      completionHandler(.noData)
-    }
-  }
-
-  // =====================
-  // Start / Stop
-  // =====================
-
-  private func startLocationUpdates() {
-    locationManager.requestAlwaysAuthorization()
-
-    // Open NEW trace file per session to avoid growing-file problems
-    // Files are named by date; export merges them
-    openTraceFile()
-
-    locationManager.startUpdatingLocation()
-    locationManager.startMonitoringSignificantLocationChanges()
-    locationManager.startMonitoringVisits()
-
-    isCollecting = true
-    lastRecordedTime = .distantPast
-
-    UserDefaults.standard.set(true, forKey: kCollectingKey)
-    UserDefaults.standard.set(intervalSeconds, forKey: kIntervalKey)
-
-    NSLog("[ZairnLocation] Started. interval: %.0fs", intervalSeconds)
-  }
-
-  private func openTraceFile() {
-    let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-    // Use single file but DON'T count lines (avoid loading file into memory)
-    let filePath = docs.appendingPathComponent("dense-trace.jsonl")
-    if !FileManager.default.fileExists(atPath: filePath.path) {
-      FileManager.default.createFile(atPath: filePath.path, contents: nil)
-    }
-    traceFileHandle = try? FileHandle(forWritingTo: filePath)
-    traceFileHandle?.seekToEndOfFile()
-    // Don't count lines — just track from this session
-    pointCount = 0
-  }
-
-  private func stopLocationUpdates() {
-    locationManager.stopUpdatingLocation()
-    locationManager.stopMonitoringSignificantLocationChanges()
-    locationManager.stopMonitoringVisits()
-    removeRollingGeofence()
-    endBackgroundTask()
-    traceFileHandle?.closeFile()
-    traceFileHandle = nil
-    isCollecting = false
-    UserDefaults.standard.set(false, forKey: kCollectingKey)
-    UserDefaults.standard.set(0, forKey: kCrashCountKey)
-    NSLog("[ZairnLocation] Stopped. Session points: %d", pointCount)
+    flutterChannelsConfigured = true
   }
 
   // =====================
@@ -178,19 +265,15 @@ import CoreLocation
 
   private func updateRollingGeofence(at location: CLLocation) {
     removeRollingGeofence()
-    let region = CLCircularRegion(
-      center: location.coordinate, radius: 100, identifier: kRegionId
-    )
+    let region = CLCircularRegion(center: location.coordinate, radius: 100, identifier: kRegionId)
     region.notifyOnExit = true
     region.notifyOnEntry = false
     locationManager.startMonitoring(for: region)
   }
 
   private func removeRollingGeofence() {
-    for region in locationManager.monitoredRegions {
-      if region.identifier == kRegionId {
-        locationManager.stopMonitoring(for: region)
-      }
+    for region in locationManager.monitoredRegions where region.identifier == kRegionId {
+      locationManager.stopMonitoring(for: region)
     }
   }
 
@@ -200,7 +283,7 @@ import CoreLocation
 
   @objc private func powerStateChanged() {
     let isLowPower = ProcessInfo.processInfo.isLowPowerModeEnabled
-    NSLog("[ZairnLocation] Low Power: %@", isLowPower ? "ON" : "OFF")
+    logEvent("LOW_POWER: \(isLowPower)")
     if isCollecting {
       if isLowPower {
         locationManager.stopUpdatingLocation()
@@ -216,24 +299,6 @@ import CoreLocation
   }
 
   // =====================
-  // Background task
-  // =====================
-
-  private func beginBackgroundTaskIfNeeded() {
-    guard backgroundTask == .invalid else { return }
-    backgroundTask = UIApplication.shared.beginBackgroundTask(withName: "ZairnGPS") { [weak self] in
-      self?.endBackgroundTask()
-    }
-  }
-
-  private func endBackgroundTask() {
-    if backgroundTask != .invalid {
-      UIApplication.shared.endBackgroundTask(backgroundTask)
-      backgroundTask = .invalid
-    }
-  }
-
-  // =====================
   // CLLocationManagerDelegate
   // =====================
 
@@ -242,55 +307,66 @@ import CoreLocation
     guard location.horizontalAccuracy >= 0 && location.horizontalAccuracy < 100 else { return }
     guard -location.timestamp.timeIntervalSinceNow < 30 else { return }
 
-    lastKnownLocation = location
-
     let now = Date()
-    if now.timeIntervalSince(lastRecordedTime) < intervalSeconds { return }
+    guard now.timeIntervalSince(lastRecordedTime) >= intervalSeconds else { return }
     lastRecordedTime = now
 
-    beginBackgroundTaskIfNeeded()
+    // Reset error count on successful location
+    gpsErrorCount = 0
+
     writePoint(location: location, now: now)
-    updateRollingGeofence(at: location)
 
-    // Successful write = not crashing. Reset crash counter.
-    UserDefaults.standard.set(0, forKey: kCrashCountKey)
+    // Update geofence only on significant movement
+    if let last = lastKnownLocation, location.distance(from: last) > 80 {
+      updateRollingGeofence(at: location)
+    } else if lastKnownLocation == nil {
+      updateRollingGeofence(at: location)
+    }
+    lastKnownLocation = location
 
-    endBackgroundTask()
+    // Reset crash counter periodically (not every write)
+    if pointCount > 0 && pointCount % 10 == 0 {
+      UserDefaults.standard.set(0, forKey: kCrashCountKey)
+    }
   }
 
   func locationManager(_ manager: CLLocationManager, didExitRegion region: CLRegion) {
     guard isCollecting, region.identifier == kRegionId else { return }
-    NSLog("[ZairnLocation] Geofence exit")
+    logEvent("GEOFENCE_EXIT")
     locationManager.requestLocation()
   }
 
   func locationManager(_ manager: CLLocationManager, didVisit visit: CLVisit) {
     guard isCollecting else { return }
-    NSLog("[ZairnLocation] Visit detected")
+    logEvent("VISIT_DETECTED")
     locationManager.startUpdatingLocation()
   }
 
   func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
-    NSLog("[ZairnLocation] Error: %@", error.localizedDescription)
-    if isCollecting {
-      locationManager.stopUpdatingLocation()
-      DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
-        self?.locationManager.startUpdatingLocation()
-      }
+    logEvent("GPS_ERROR(\(gpsErrorCount)): \(error.localizedDescription)")
+    guard isCollecting, !isRestarting else { return }
+
+    gpsErrorCount += 1
+    // Give up after 5 consecutive errors (avoid infinite restart loop)
+    guard gpsErrorCount < 5 else {
+      logEvent("GPS_ERROR: giving up after \(gpsErrorCount) errors")
+      return
+    }
+
+    isRestarting = true
+    locationManager.stopUpdatingLocation()
+    DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in
+      guard let self = self, self.isCollecting else { return }
+      self.isRestarting = false
+      self.locationManager.startUpdatingLocation()
     }
   }
 
   // =====================
-  // File writing — minimal, no memory allocation beyond the point
+  // File writing — OutputStream only (no FileHandle, no NSException)
   // =====================
 
   private func writePoint(location: CLLocation, now: Date) {
-    // Reopen file handle if it was closed (e.g., after background kill)
-    if traceFileHandle == nil {
-      openTraceFile()
-    }
-
-    // Manual JSON string construction — no JSONSerialization overhead
     let line = String(format:
       "{\"latitude\":%.7f,\"longitude\":%.7f,\"accuracy\":%.0f,\"speed\":%.1f,\"altitude\":%.1f,\"heading\":%.1f,\"timestamp\":%.0f}\n",
       location.coordinate.latitude,
@@ -302,15 +378,17 @@ import CoreLocation
       now.timeIntervalSince1970 * 1000
     )
 
-    if let data = line.data(using: .utf8) {
-      traceFileHandle?.write(data)
-      traceFileHandle?.synchronizeFile()
+    guard let data = line.data(using: .utf8) else { return }
+
+    if safeFileWrite(data) {
       pointCount += 1
+    } else {
+      logEvent("FILE_WRITE_FAILED")
     }
 
-    // Send to Flutter only when active
+    // Flutter events only when active
     if UIApplication.shared.applicationState == .active {
-      let data: [String: Any] = [
+      let eventData: [String: Any] = [
         "latitude": location.coordinate.latitude,
         "longitude": location.coordinate.longitude,
         "accuracy": location.horizontalAccuracy,
@@ -320,13 +398,71 @@ import CoreLocation
         "timestamp": now.timeIntervalSince1970 * 1000,
       ]
       DispatchQueue.main.async { [weak self] in
-        self?.eventSink?(data)
+        self?.eventSink?(eventData)
       }
     }
 
-    NSLog("[ZairnLocation] #%d %.6f,%.6f ±%.0fm", pointCount,
-          location.coordinate.latitude, location.coordinate.longitude,
-          location.horizontalAccuracy)
+    // Log only in foreground (NSLog in background wastes CPU/IO)
+    if UIApplication.shared.applicationState == .active {
+      NSLog("[ZairnLocation] #%d %.4f,%.4f ±%.0fm", pointCount,
+            location.coordinate.latitude, location.coordinate.longitude,
+            location.horizontalAccuracy)
+    }
+  }
+
+  private func safeFileWrite(_ data: Data) -> Bool {
+    guard let stream = OutputStream(url: traceFilePath, append: true) else { return false }
+    stream.open()
+    defer { stream.close() }
+    return data.withUnsafeBytes { ptr -> Bool in
+      guard let base = ptr.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return false }
+      return stream.write(base, maxLength: data.count) > 0
+    }
+  }
+
+  // =====================
+  // Crash & event logging
+  // =====================
+
+  private func installCrashLogger() {
+    if FileManager.default.fileExists(atPath: crashLogFilePath.path) {
+      if let prev = try? String(contentsOf: crashLogFilePath, encoding: .utf8), !prev.isEmpty {
+        NSLog("[ZairnCrashLog] PREVIOUS:\n%@", prev.suffix(2000))
+      }
+    }
+
+    NSSetUncaughtExceptionHandler { exception in
+      let msg = "UNCAUGHT: \(exception.name.rawValue): \(exception.reason ?? "?") | \(exception.callStackSymbols.prefix(5).joined(separator: "\n"))"
+      AppDelegate.writeToLog(msg)
+    }
+  }
+
+  func logEvent(_ msg: String) {
+    let ts = AppDelegate.isoFormatter.string(from: Date())
+    let line = "[\(ts)] \(msg)"
+    // NSLog only in foreground (background NSLog wastes resources)
+    if UIApplication.shared.applicationState == .active {
+      NSLog("[ZairnLocation] %@", msg)
+    }
+    AppDelegate.writeToLog(line)
+  }
+
+  private static func writeToLog(_ msg: String) {
+    let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+    let url = docs.appendingPathComponent("zairn-crash-log.txt")
+    guard let data = (msg + "\n").data(using: .utf8) else { return }
+
+    if !FileManager.default.fileExists(atPath: url.path) {
+      FileManager.default.createFile(atPath: url.path, contents: data)
+      return
+    }
+    guard let stream = OutputStream(url: url, append: true) else { return }
+    stream.open()
+    data.withUnsafeBytes { ptr in
+      guard let base = ptr.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
+      stream.write(base, maxLength: data.count)
+    }
+    stream.close()
   }
 }
 

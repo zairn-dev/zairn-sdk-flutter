@@ -96,9 +96,15 @@ class _TraceCollectorPageState extends State<TraceCollectorPage> with WidgetsBin
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.paused || state == AppLifecycleState.inactive) {
+      // Release Dart-side resources to reduce memory pressure
+      _privacyProcessor = null; // Will be recreated on next point
+      _lastPrivacyState = null;
+      // Don't clear _lastPoint — it's tiny and useful on resume
+      debugPrint('[Zairn] Background: released Dart resources');
+    }
     if (state == AppLifecycleState.resumed) {
-      // Reload point count from file after a safe delay
-      Future.delayed(const Duration(seconds: 1), () {
+      Future.delayed(const Duration(seconds: 2), () {
         if (mounted) {
           _reloadPointCount();
         }
@@ -111,14 +117,11 @@ class _TraceCollectorPageState extends State<TraceCollectorPage> with WidgetsBin
       if (_traceFile == null || !await _traceFile!.exists()) return;
       final bytes = await _traceFile!.length();
       if (bytes == 0) return;
-      // Count lines without loading entire file
-      final stream = _traceFile!.openRead();
-      int count = 0;
-      await for (final chunk in stream.transform(utf8.decoder).transform(const LineSplitter())) {
-        if (chunk.trim().isNotEmpty) count++;
-      }
+      // Estimate count from file size (~150 bytes per line)
+      // Avoids reading the entire file on resume
+      final estimated = bytes ~/ 150;
       if (mounted) {
-        setState(() => _pointCount = count);
+        setState(() => _pointCount = estimated);
       }
     } catch (e) {
       debugPrint('Reload error: $e');
@@ -129,10 +132,25 @@ class _TraceCollectorPageState extends State<TraceCollectorPage> with WidgetsBin
     final dir = await getApplicationDocumentsDirectory();
     _traceFile = File('${dir.path}/dense-trace.jsonl');
     if (await _traceFile!.exists()) {
-      final lines = await _traceFile!.readAsLines();
-      _pointCount = lines.length;
-      if (lines.isNotEmpty) {
-        try { _lastPoint = jsonDecode(lines.last) as Map<String, dynamic>; } catch (_) {}
+      // Estimate point count from file size (avoid reading entire file)
+      final bytes = await _traceFile!.length();
+      _pointCount = bytes > 0 ? bytes ~/ 150 : 0;
+
+      // Read only the last line for display (read last 300 bytes)
+      if (bytes > 0) {
+        try {
+          final raf = await _traceFile!.open(mode: FileMode.read);
+          final readFrom = bytes > 300 ? bytes - 300 : 0;
+          await raf.setPosition(readFrom);
+          final tail = await raf.read(300);
+          await raf.close();
+          final tailStr = utf8.decode(tail, allowMalformed: true);
+          final lines = tailStr.split('\n').where((l) => l.trim().isNotEmpty).toList();
+          if (lines.isNotEmpty) {
+            final decoded = jsonDecode(lines.last);
+            _lastPoint = _normalizePoint(decoded);
+          }
+        } catch (_) {}
       }
     }
     if (mounted) setState(() {});
@@ -142,7 +160,17 @@ class _TraceCollectorPageState extends State<TraceCollectorPage> with WidgetsBin
     if (_traceFile == null) return;
     await _traceFile!.writeAsString('${jsonEncode(point)}\n', mode: FileMode.append);
     _pointCount++;
-    _lastPoint = point;
+    _lastPoint = _normalizePoint(point);
+  }
+
+  Map<String, dynamic>? _normalizePoint(dynamic raw) {
+    if (raw is! Map) return null;
+    final point = Map<String, dynamic>.from(raw);
+    final lat = point['lat'] ?? point['latitude'];
+    final lon = point['lon'] ?? point['longitude'];
+    if (lat != null) point['lat'] = lat;
+    if (lon != null) point['lon'] = lon;
+    return point;
   }
 
   // =====================
@@ -368,6 +396,38 @@ class _TraceCollectorPageState extends State<TraceCollectorPage> with WidgetsBin
     setState(() { _pointCount = 0; _lastPoint = null; _lastPrivacyState = null; });
   }
 
+  Future<void> _showCrashLog() async {
+    try {
+      final dir = await getApplicationDocumentsDirectory();
+      final logFile = File('${dir.path}/zairn-crash-log.txt');
+      String content = 'No crash log found.';
+      if (await logFile.exists()) {
+        content = await logFile.readAsString();
+        if (content.length > 3000) content = '...(truncated)\n${content.substring(content.length - 3000)}';
+      }
+      if (!mounted) return;
+      if (!context.mounted) return;
+      showDialog(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('Crash Log'),
+          content: SingleChildScrollView(child: Text(content, style: const TextStyle(fontSize: 10, fontFamily: 'monospace'))),
+          actions: [
+            TextButton(onPressed: () async {
+              final f = File('${dir.path}/zairn-crash-log.txt');
+              if (await f.exists()) await f.delete();
+              Navigator.pop(ctx);
+              _showSnackBar('Log cleared');
+            }, child: const Text('Clear Log')),
+            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Close')),
+          ],
+        ),
+      );
+    } catch (e) {
+      _showSnackBar('Error reading log: $e');
+    }
+  }
+
   void _showSnackBar(String msg) {
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
@@ -398,7 +458,10 @@ class _TraceCollectorPageState extends State<TraceCollectorPage> with WidgetsBin
     return Scaffold(
       appBar: AppBar(
         title: const Text('Zairn Trace Collector'),
-        actions: [IconButton(icon: const Icon(Icons.delete_outline), onPressed: _clear)],
+        actions: [
+          IconButton(icon: const Icon(Icons.bug_report), onPressed: _showCrashLog),
+          IconButton(icon: const Icon(Icons.delete_outline), onPressed: _clear),
+        ],
       ),
       body: Padding(
         padding: const EdgeInsets.all(16),
