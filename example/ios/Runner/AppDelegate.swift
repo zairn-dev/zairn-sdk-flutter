@@ -17,8 +17,8 @@ import CoreLocation
   private var flutterChannelsConfigured = false
   private var isRestarting = false
   private var gpsErrorCount = 0
-  @available(iOS 17.0, *)
-  private lazy var _bgActivitySession: CLBackgroundActivitySession? = nil
+  // CLBackgroundActivitySession stored as Any? to avoid @available on stored property
+  private var _bgActivitySession: Any? = nil
 
   private let kCollectingKey = "zairn_is_collecting"
   private let kIntervalKey = "zairn_interval_seconds"
@@ -178,7 +178,12 @@ import CoreLocation
   // =====================
 
   private func startLocationUpdates() {
-    let status = locationManager.authorizationStatus
+    let status: CLAuthorizationStatus
+    if #available(iOS 14.0, *) {
+      status = locationManager.authorizationStatus
+    } else {
+      status = CLLocationManager.authorizationStatus()
+    }
     if status == .notDetermined {
       locationManager.requestAlwaysAuthorization()
     }
@@ -186,11 +191,9 @@ import CoreLocation
     ensureTraceFileExists()
 
     // iOS 17+: CLBackgroundActivitySession tells iOS to prioritize this app
-    if #available(iOS 17.0, *) {
-      if _bgActivitySession == nil {
-        _bgActivitySession = CLBackgroundActivitySession()
-        logEvent("CLBackgroundActivitySession started")
-      }
+    if #available(iOS 17.0, *), _bgActivitySession == nil {
+      _bgActivitySession = CLBackgroundActivitySession()
+      logEvent("CLBackgroundActivitySession started")
     }
 
     // Activity type hint: .other is most general
@@ -216,8 +219,8 @@ import CoreLocation
     locationManager.stopMonitoringSignificantLocationChanges()
     locationManager.stopMonitoringVisits()
     removeRollingGeofence()
-    if #available(iOS 17.0, *) {
-      _bgActivitySession?.invalidate()
+    if #available(iOS 17.0, *), let session = _bgActivitySession as? CLBackgroundActivitySession {
+      session.invalidate()
       _bgActivitySession = nil
     }
     isCollecting = false
