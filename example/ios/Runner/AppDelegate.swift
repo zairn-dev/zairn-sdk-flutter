@@ -17,7 +17,8 @@ import CoreLocation
   private var flutterChannelsConfigured = false
   private var isRestarting = false
   private var gpsErrorCount = 0
-  private var bgActivitySession: NSObject? // CLBackgroundActivitySession (iOS 17+)
+  @available(iOS 17.0, *)
+  private lazy var _bgActivitySession: CLBackgroundActivitySession? = nil
 
   private let kCollectingKey = "zairn_is_collecting"
   private let kIntervalKey = "zairn_interval_seconds"
@@ -58,12 +59,15 @@ import CoreLocation
 
     // Plugin registration
     GeneratedPluginRegistrant.register(with: self)
-    if let pluginClass = NSClassFromString("FlutterForegroundTaskPlugin") as? NSObjectProtocol {
+    // flutter_foreground_task callback (safe: only if class exists at runtime)
+    if NSClassFromString("FlutterForegroundTaskPlugin") != nil {
+      let cb: @convention(block) (FlutterPluginRegistry) -> Void = { registry in
+        GeneratedPluginRegistrant.register(with: registry)
+      }
       let sel = NSSelectorFromString("setPluginRegistrantCallback:")
-      if pluginClass.responds(to: sel) {
-        FlutterForegroundTaskPlugin.setPluginRegistrantCallback { registry in
-          GeneratedPluginRegistrant.register(with: registry)
-        }
+      if let cls = NSClassFromString("FlutterForegroundTaskPlugin") as? NSObject.Type,
+         cls.responds(to: sel) {
+        cls.perform(sel, with: cb)
       }
     }
 
@@ -82,7 +86,12 @@ import CoreLocation
       name: NSNotification.Name.NSProcessInfoPowerStateDidChange, object: nil
     )
 
-    UIApplication.shared.setMinimumBackgroundFetchInterval(UIApplication.backgroundFetchIntervalMinimum)
+    // Background fetch (deprecated in iOS 13 but still functional)
+    if #available(iOS 13.0, *) {
+      // BGTaskScheduler is handled by flutter_foreground_task plugin
+    } else {
+      UIApplication.shared.setMinimumBackgroundFetchInterval(UIApplication.backgroundFetchIntervalMinimum)
+    }
 
     // Auto-resume (crash counter is NOT incremented here — only on actual start)
     let wasCollecting = UserDefaults.standard.bool(forKey: kCollectingKey)
@@ -178,8 +187,8 @@ import CoreLocation
 
     // iOS 17+: CLBackgroundActivitySession tells iOS to prioritize this app
     if #available(iOS 17.0, *) {
-      if bgActivitySession == nil {
-        bgActivitySession = CLBackgroundActivitySession() as NSObject
+      if _bgActivitySession == nil {
+        _bgActivitySession = CLBackgroundActivitySession()
         logEvent("CLBackgroundActivitySession started")
       }
     }
@@ -208,8 +217,8 @@ import CoreLocation
     locationManager.stopMonitoringVisits()
     removeRollingGeofence()
     if #available(iOS 17.0, *) {
-      (bgActivitySession as? CLBackgroundActivitySession)?.invalidate()
-      bgActivitySession = nil
+      _bgActivitySession?.invalidate()
+      _bgActivitySession = nil
     }
     isCollecting = false
     isRestarting = false
